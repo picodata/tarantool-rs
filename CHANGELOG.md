@@ -5,9 +5,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [Unreleased] - XXXX-XX-XX
+## [0.0.11-picodata] - 2026-08-31
+
 ### Changed
- - When connection closes, requests that was not sent but already stuck in internal channels, is going to be sent after new connection is created.
+ - refactor: updated dependencies and cleaning up the project
 
 
 ## [0.0.10] - 2023-10-04
@@ -82,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  - `Request` struct renamed to `EncodedRequest`;
  - `RequestBody` trait renamed to `Request`;
  - `Space` API, which simplify making `select` and CRUD requsts on specific space.
- 
+
 ### Changed
  - `ConnectionLike` now `Send` and `Sync`.
 
