@@ -4,11 +4,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [picodata-0.12] - 2026-09-02
 
-## [0.0.11-picodata] - 2026-08-31
+### Fixed
+ - Failed channel means that connection closed
+
+## [picodata-0.11] - 2026-08-31
 
 ### Changed
- - refactor: updated dependencies and cleaning up the project
+ - updated dependencies and cleaning up the project
 
 
 ## [0.0.10] - 2023-10-04

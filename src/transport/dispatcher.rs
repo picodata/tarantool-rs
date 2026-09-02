@@ -73,9 +73,11 @@ impl DispatcherSender {
 
             // SAFETY: initial value is put in Option immediately.
             // On next iterations value is put in Option right before `continue` expression.
-            if let Err(send_err) = self.tx.send((request.take().unwrap(), tx)).await {
-                request = Some(send_err.0.0);
-                continue;
+            //
+            // A failed send means the dispatcher task is gone, which is
+            // permanent — retrying would spin forever.
+            if self.tx.send((request.take().unwrap(), tx)).await.is_err() {
+                return Err(Error::ConnectionClosed);
             }
 
             match rx.await {
