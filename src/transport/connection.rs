@@ -134,7 +134,18 @@ async fn writer_task(
 ) -> (Result<(), (u32, CodecEncodeError)>, Vec<EncodedRequest>) {
     let mut result = Ok(());
 
-    while let Some(x) = rx.recv().await {
+    loop {
+        // NOTE: waiting for the next request must also be interruptible by the
+        // token: `writer_tx` lives in `Connection::run` until the very end of the
+        // function, so `rx.recv()` on its own never returns `None` and `run`
+        // would hang forever on `writer_task_handle.await`.
+        let x = tokio::select! {
+            () = cancellation_token.cancelled() => break,
+            next = rx.recv() => match next {
+                Some(x) => x,
+                None => break,
+            },
+        };
         let sync = x.sync;
         let fut = CancellableFuture::new(stream.send(x), &cancellation_token);
         match fut.await {
