@@ -2431,7 +2431,6 @@ dependencies = [
  "futures",
  "lru",
  "parking_lot",
- "pin-project",
  "pretty_env_logger",
  "rmp",
  "rmp-serde",

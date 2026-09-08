@@ -30,7 +30,6 @@ use crate::{
         response::{Response, ResponseBody},
     },
     errors::{CodecEncodeError, ConnectionError, Error},
-    utils::CancellableFuture,
 };
 
 struct ConnectionData {
@@ -139,22 +138,19 @@ async fn writer_task(
         // token: `writer_tx` lives in `Connection::run` until the very end of the
         // function, so `rx.recv()` on its own never returns `None` and `run`
         // would hang forever on `writer_task_handle.await`.
-        let x = tokio::select! {
-            () = cancellation_token.cancelled() => break,
-            next = rx.recv() => match next {
-                Some(x) => x,
-                None => break,
-            },
+        // `None` means the token was cancelled, `Some(None)` that the queue was
+        // closed; both end the loop.
+        let Some(Some(x)) = cancellation_token.run_until_cancelled(rx.recv()).await else {
+            break;
         };
         let sync = x.sync;
-        let fut = CancellableFuture::new(stream.send(x), &cancellation_token);
-        match fut.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
+        match cancellation_token.run_until_cancelled(stream.send(x)).await {
+            Some(Ok(())) => {}
+            Some(Err(err)) => {
                 result = Err((sync, err));
                 break;
             }
-            Err(()) => {
+            None => {
                 // Do not set error since task was cancelled externally.
                 // Should respond with ConnectionClosed in main task
                 break;

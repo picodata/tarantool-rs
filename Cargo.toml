@@ -20,7 +20,6 @@ fastrand = "2"
 futures = "0.3"
 lru = "0.18.2"
 parking_lot = { version = "0.12", features = ["send_guard"] }
-pin-project = "1"
 rmp = "0.8"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
