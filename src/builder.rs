@@ -108,7 +108,7 @@ impl ConnectionBuilder {
             addr,
             self.user.as_deref(),
             self.password.as_deref(),
-            self.timeout,
+            self.connect_timeout,
             self.reconnect_interval.clone(),
             self.internal_simultaneous_requests_threshold,
         )
