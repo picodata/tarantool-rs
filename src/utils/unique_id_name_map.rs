@@ -8,6 +8,12 @@ use std::{
 
 use anyhow::bail;
 
+/// Initial capacity for a map built from `iter`: its lower size bound, which
+/// is exact for exact-size iterators.
+fn initial_capacity<I: Iterator>(iter: &I) -> usize {
+    iter.size_hint().0
+}
+
 #[doc(hidden)]
 pub trait UniqueIdName {
     fn id(&self) -> &u32;
@@ -112,7 +118,7 @@ impl<T: UniqueIdName> UniqueIdNameMap<T> {
                 )
             }
             (None, Some(right)) => {
-                bail!("New value with id '{}' replaced only by id", right.0.name())
+                bail!("New value with id '{}' replaced only by id", right.0.id())
             }
             _ => {}
         }
@@ -124,12 +130,7 @@ impl<T: UniqueIdName> UniqueIdNameMap<T> {
         I: IntoIterator<Item = T>,
     {
         let iter = iter.into_iter();
-        let size_hint = if let (start, Some(end)) = iter.size_hint() {
-            end.saturating_sub(start)
-        } else {
-            1
-        };
-        let mut map = Self::with_capacity(size_hint);
+        let mut map = Self::with_capacity(initial_capacity(&iter));
         for x in iter {
             let _ = map.insert(x)?;
         }
@@ -179,5 +180,40 @@ impl<T: fmt::Debug> fmt::Debug for UniqueIdNameMap<T> {
         f.debug_list()
             .entries(self.by_id.iter().map(|x| &*x.0))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Item {
+        id: u32,
+        name: &'static str,
+    }
+
+    impl UniqueIdName for Item {
+        fn id(&self) -> &u32 {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+    }
+
+    #[test]
+    fn replacing_only_by_id_reports_the_id() {
+        let mut map = UniqueIdNameMap::new();
+        assert!(map.insert(Item { id: 7, name: "a" }).is_ok());
+        let err = map.insert(Item { id: 7, name: "b" }).unwrap_err();
+        assert_eq!(err.to_string(), "New value with id '7' replaced only by id");
+    }
+
+    #[test]
+    fn initial_capacity_is_the_lower_size_bound() {
+        assert_eq!(initial_capacity(&[1, 2, 3].iter()), 3);
+        assert_eq!(initial_capacity(&(0..10).filter(|x| x % 2 == 0)), 0);
     }
 }

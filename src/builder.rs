@@ -192,7 +192,11 @@ impl ConnectionBuilder {
 
     /// Sets interval between reconnection attempts.
     ///
-    /// If disabled, next attempt wil lbe started as soon as last one finished.
+    /// If disabled (`None`), the next attempt starts as soon as the previous
+    /// one finishes, with no delay at all. While connects fail fast (for
+    /// example against a refused port) this busy-loops a CPU core for as long
+    /// as the server stays unreachable, so the default backoff is the safe
+    /// choice.
     ///
     /// By default set to `ReconnectInterval::exponential_backoff(Duration::from_millis(1), Duration::from_secs(1), 0.5, 5.0)`.
     pub fn reconnect_interval(
@@ -203,7 +207,7 @@ impl ConnectionBuilder {
         self
     }
 
-    /// Sets capacity of SQL statment cache.
+    /// Sets capacity of SQL statement cache.
     ///
     /// Setting 0 disables cache. By default set to 500.
     pub fn sql_statement_cache_capacity(&mut self, capacity: usize) -> &mut Self {
