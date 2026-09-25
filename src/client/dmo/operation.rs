@@ -167,7 +167,26 @@ mod ops {
     pub(super) const OR: &str = "|";
     pub(super) const XOR: &str = "^";
     pub(super) const STRING_SPLICE: &str = ":";
-    pub(super) const INSERT: &str = "|";
+    pub(super) const INSERT: &str = "!";
     pub(super) const DEL: &str = "#";
     pub(super) const ASSIGN: &str = "=";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(op: &DmoOperation<'_>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        TupleElement::encode_into_writer(op, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn insert_encodes_exclamation_mark() {
+        let insert = encode(&DmoOperation::insert(1u32, 42));
+        // fixarray(3), fixstr(1), operator
+        assert_eq!(&insert[..3], &[0x93, 0xa1, b'!']);
+        assert_ne!(insert, encode(&DmoOperation::or(1u32, 42)));
+    }
 }

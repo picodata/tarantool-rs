@@ -288,3 +288,33 @@ async fn upsert_on_existing_tuple_applies_operations() -> Result<(), anyhow::Err
 
     Ok(())
 }
+
+#[tokio::test]
+#[traced_test]
+async fn dmo_insert_operation_inserts_a_field() -> Result<(), anyhow::Error> {
+    let container = TarantoolTestContainer::new_with_test_data();
+    let conn = container.create_conn().await?;
+    let space = conn
+        .space("ds9_crew")
+        .await?
+        .expect("Space 'ds9_crew' found");
+
+    // `!` shifts the old fields right. A bitwise OR (`|`) would instead be
+    // rejected, because its argument is a string.
+    let updated: (u32, String, String, String, String) = space
+        .update((1u32,), (DmoOperation::insert(1u32, "Emissary"),))
+        .await?
+        .decode()?;
+    assert_eq!(
+        updated,
+        (
+            1,
+            "Emissary".into(),
+            "Benjamin Sisko".into(),
+            "Commander".into(),
+            "Commanding officer".into()
+        )
+    );
+
+    Ok(())
+}
