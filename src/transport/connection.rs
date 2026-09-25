@@ -342,7 +342,7 @@ impl Connection {
         let send_to_writer_future = Fuse::terminated();
         pin!(send_to_writer_future);
 
-        let result = loop {
+        let mut result = loop {
             tokio::select! {
                 // Read value from TCP stream
                 next = Connection::get_next_stream_value(&mut read_stream) => {
@@ -394,6 +394,7 @@ impl Connection {
         match writer_task_handle.await {
             Err(err) => {
                 error!("Failed to await writer task's handle: {err}");
+                result = result.and(Err(err.into()));
             }
             Ok((result, not_sent_requests_from_writer)) => {
                 not_sent_requests.extend(not_sent_requests_from_writer);
@@ -469,6 +470,48 @@ mod tests {
         let addr = spawn_greeting_only_server().await;
         let conn = Connection::new_inner(addr, None, None, 50).await;
         assert!(conn.is_ok());
+    }
+
+    /// Build a connection over a local socket pair, with a custom writer task.
+    async fn connection_with_writer(
+        writer: impl Future<Output = (Result<(), (u32, CodecEncodeError)>, Vec<EncodedRequest>)>
+        + Send
+        + 'static,
+    ) -> (Connection, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (read, _write) = client.into_split();
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let conn = Connection {
+            read_stream: FramedRead::new(read, ClientCodec::default()),
+            writer_tx,
+            writer_task_handle: tokio::spawn(writer),
+            writer_task_cancellation_token: CancellationToken::new(),
+            data: ConnectionData::default(),
+        };
+        (conn, server)
+    }
+
+    #[tokio::test]
+    async fn writer_task_panic_is_reported_as_error() {
+        let (conn, _server) =
+            connection_with_writer(async { panic!("writer task panicked") }).await;
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherRequest>(1);
+        let mut client_rx = ReceiverStream::new(client_rx);
+        drop(client_tx);
+        assert!(conn.run(&mut client_rx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn writer_task_clean_exit_is_reported_as_ok() {
+        let (conn, _server) = connection_with_writer(async { (Ok(()), Vec::new()) }).await;
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherRequest>(1);
+        let mut client_rx = ReceiverStream::new(client_rx);
+        drop(client_tx);
+        assert!(conn.run(&mut client_rx).await.is_ok());
     }
 
     #[tokio::test]
