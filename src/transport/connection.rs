@@ -224,8 +224,9 @@ impl Connection {
 
         // TODO: review size of this queue
         // Make this queue slightly larger than queue between Client and Dispatcher
-        let (writer_tx, writer_rx) =
-            mpsc::channel(internal_simultaneous_requests_threshold / 100 * 105);
+        let (writer_tx, writer_rx) = mpsc::channel(
+            (internal_simultaneous_requests_threshold.saturating_mul(105) / 100).max(1),
+        );
         let writer_task_cancellation_token = CancellationToken::new();
         let writer_task_handle = tokio::spawn(writer_task(
             writer_rx,
@@ -415,5 +416,55 @@ impl Connection {
         data.return_requests_to_be_resent(not_sent_requests);
 
         result.map_err(drop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+    /// Syntactically valid 128-byte greeting whose salt is 32 zero bytes.
+    fn fake_greeting() -> [u8; Greeting::SIZE] {
+        let mut buf = [b' '; Greeting::SIZE];
+        let line1 = b"Tarantool 2.11.0 (Binary) fake-uuid";
+        buf[..line1.len()].copy_from_slice(line1);
+        buf[63] = b'\n';
+        let mut salt = [b'A'; 44];
+        salt[43] = b'=';
+        buf[64..108].copy_from_slice(&salt);
+        buf[127] = b'\n';
+        buf
+    }
+
+    /// Fake server which writes the greeting and then keeps the socket open,
+    /// draining whatever the client sends.
+    async fn spawn_greeting_only_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = sock.write_all(&fake_greeting()).await;
+                    let mut buf = [0u8; 1024];
+                    while sock.read(&mut buf).await.unwrap_or(0) != 0 {}
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn small_threshold_does_not_panic() {
+        let addr = spawn_greeting_only_server().await;
+        let conn = Connection::new_inner(addr, None, None, 50).await;
+        assert!(conn.is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_threshold_does_not_panic() {
+        let addr = spawn_greeting_only_server().await;
+        let conn = Connection::new_inner(addr, None, None, 500).await;
+        assert!(conn.is_ok());
     }
 }
