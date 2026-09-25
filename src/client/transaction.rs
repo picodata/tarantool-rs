@@ -19,7 +19,11 @@ use crate::{
 /// If tranasction have a timeout and no requests made for that time, tranasction is automatically
 /// rolled back.
 ///
-/// On drop tranasaction is rolled back, if not have been commited or rolled back already.
+/// On drop the transaction is rolled back, unless it has already been
+/// committed or rolled back (successfully or not, since both count as
+/// finished), or the connection was re-established since the transaction
+/// began, in which case the server already discarded it with the old
+/// connection and there is nothing left to roll back.
 pub struct Transaction {
     conn: Connection,
     stream_id: u32,
@@ -60,28 +64,40 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns an error if the request failed to reach Tarantool or
-    /// Tarantool responded with an error.
+    /// Tarantool responded with an error. The transaction counts as
+    /// finished either way, so `Drop` never sends a second rollback.
+    /// Returns [`Error::ConnectionReset`][crate::Error::ConnectionReset] if
+    /// the connection was re-established since the transaction began.
     pub async fn commit(mut self) -> Result<()> {
-        if !self.finished {
-            debug!("Commiting tranasction on stream {}", self.stream_id);
-            let _ = self.send_request(Commit::default()).await?;
-            self.finished = true;
+        if self.finished {
+            return Ok(());
         }
-        Ok(())
+        debug!("Commiting tranasction on stream {}", self.stream_id);
+        let res = self.send_request(Commit::default()).await.map(drop);
+        // Finished even on error: the caller holds the error, and a
+        // server-side transaction that survived dies with its stream or
+        // connection, so `Drop` must not send a second rollback.
+        self.finished = true;
+        res
     }
 
     /// Rollback tranasction.
     /// # Errors
     ///
     /// Returns an error if the request failed to reach Tarantool or
-    /// Tarantool responded with an error.
+    /// Tarantool responded with an error. The transaction counts as
+    /// finished either way, so `Drop` never sends a second rollback.
+    /// Returns [`Error::ConnectionReset`][crate::Error::ConnectionReset] if
+    /// the connection was re-established since the transaction began.
     pub async fn rollback(mut self) -> Result<()> {
-        if !self.finished {
-            debug!("Rolling back tranasction on stream {}", self.stream_id);
-            let _ = self.send_request(Rollback::default()).await?;
-            self.finished = true;
+        if self.finished {
+            return Ok(());
         }
-        Ok(())
+        debug!("Rolling back tranasction on stream {}", self.stream_id);
+        let res = self.send_request(Rollback::default()).await.map(drop);
+        // See `commit`.
+        self.finished = true;
+        res
     }
 }
 

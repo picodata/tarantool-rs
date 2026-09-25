@@ -293,7 +293,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{consts::RequestType, response::Response},
+        codec::consts::RequestType,
+        codec::response::Response,
+        errors::ErrorResponse,
         transport::{ClientRequest, DispatcherMessage},
     };
 
@@ -314,6 +316,15 @@ mod tests {
 
     fn ok_body(_request_type: u8) -> ResponseBody {
         ResponseBody::Ok(Value::Map(Vec::new()))
+    }
+
+    fn reject_commit_and_rollback(request_type: u8) -> ResponseBody {
+        if request_type == RequestType::Commit as u8 || request_type == RequestType::Rollback as u8
+        {
+            ResponseBody::Error(ErrorResponse::new(1, "rejected".into(), None))
+        } else {
+            ok_body(request_type)
+        }
     }
 
     /// Fake dispatcher: answers every request with `reply(request_type)` and
@@ -344,6 +355,47 @@ mod tests {
             }
         });
         seen
+    }
+
+    #[tokio::test]
+    async fn failed_commit_finishes_the_transaction() {
+        let (tx, rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+        let seen = spawn_fake_dispatcher(rx, reject_commit_and_rollback);
+
+        let transaction = conn.transaction().await.unwrap();
+        let res = transaction.commit().await;
+        assert!(matches!(res, Err(Error::Response(_))), "{res:?}");
+
+        // Give a drop-time rollback, if any, the chance to reach the dispatcher.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (RequestType::Begin as u8, Some(1)),
+                (RequestType::Commit as u8, Some(1)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_rollback_finishes_the_transaction() {
+        let (tx, rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+        let seen = spawn_fake_dispatcher(rx, reject_commit_and_rollback);
+
+        let transaction = conn.transaction().await.unwrap();
+        let res = transaction.rollback().await;
+        assert!(matches!(res, Err(Error::Response(_))), "{res:?}");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (RequestType::Begin as u8, Some(1)),
+                (RequestType::Rollback as u8, Some(1)),
+            ]
+        );
     }
 
     #[tokio::test]
