@@ -1,5 +1,15 @@
-use std::{fmt::Display, future::Future, pin::Pin, time::Duration};
+use std::{
+    fmt::Display,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
+use parking_lot::RwLock;
 use tokio::{
     net::ToSocketAddrs,
     sync::{mpsc, oneshot},
@@ -10,7 +20,10 @@ use tracing::{debug, error};
 use super::connection::Connection;
 use crate::{
     Error, ReconnectInterval,
-    codec::{request::EncodedRequest, response::Response},
+    codec::{
+        request::{ConnectionFeatures, EncodedRequest},
+        response::Response,
+    },
 };
 
 pub(crate) type DispatcherRequest = (EncodedRequest, DispatcherResponseSender);
@@ -53,12 +66,21 @@ impl DispatcherResponseSender {
 
 pub(crate) struct DispatcherSender {
     tx: mpsc::Sender<DispatcherRequest>,
+    generation: Arc<AtomicU64>,
 }
 
 impl DispatcherSender {
     #[cfg(test)]
-    pub(crate) fn new_for_test(tx: mpsc::Sender<DispatcherRequest>) -> Self {
-        Self { tx }
+    pub(crate) fn new_for_test(
+        tx: mpsc::Sender<DispatcherRequest>,
+        generation: Arc<AtomicU64>,
+    ) -> Self {
+        Self { tx, generation }
+    }
+
+    /// Generation of the transport connection; see [`Dispatcher::generation`].
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub(crate) async fn send(&self, request: EncodedRequest) -> Result<Response, Error> {
@@ -80,6 +102,7 @@ impl DispatcherSender {
 }
 
 type ConnectDynFuture = dyn Future<Output = Result<Connection, Error>> + Send;
+type ConnFactory = Box<dyn Fn() -> Pin<Box<ConnectDynFuture>> + Send + Sync>;
 
 /// Dispatching messages from client to connection.
 ///
@@ -87,8 +110,12 @@ type ConnectDynFuture = dyn Future<Output = Result<Connection, Error>> + Send;
 pub(crate) struct Dispatcher {
     rx: ReceiverStream<DispatcherRequest>,
     conn: Option<Connection>,
-    conn_factory: Box<dyn Fn() -> Pin<Box<ConnectDynFuture>> + Send + Sync>,
+    conn_factory: ConnFactory,
     reconnect_interval: Option<ReconnectInterval>,
+    /// Bumped after every successful reconnect, before requests flow on the
+    /// new connection. Streams and transactions compare it with the value
+    /// they captured at creation.
+    generation: Arc<AtomicU64>,
 }
 
 impl Dispatcher {
@@ -99,17 +126,19 @@ impl Dispatcher {
         connect_timeout: Option<Duration>,
         reconnect_interval: Option<ReconnectInterval>,
         internal_simultaneous_requests_threshold: usize,
+        features: Arc<RwLock<ConnectionFeatures>>,
     ) -> Result<(impl Future<Output = ()> + use<A>, DispatcherSender), Error>
     where
         A: ToSocketAddrs + Display + Clone + Send + Sync + 'static,
     {
         let user: Option<String> = user.map(Into::into);
         let password: Option<String> = password.map(Into::into);
-        let conn_factory = Box::new(move || {
+        let conn_factory: ConnFactory = Box::new(move || {
             let addr = addr.clone();
             let user = user.clone();
             let password = password.clone();
             let connect_timeout = connect_timeout;
+            let features = features.clone();
             Box::pin(async move {
                 Connection::new(
                     addr,
@@ -117,6 +146,7 @@ impl Dispatcher {
                     password.as_deref(),
                     connect_timeout,
                     internal_simultaneous_requests_threshold,
+                    &features,
                 )
                 .await
             }) as Pin<Box<ConnectDynFuture>>
@@ -124,18 +154,34 @@ impl Dispatcher {
 
         let conn = conn_factory().await?;
 
-        let (tx, rx) = mpsc::channel(internal_simultaneous_requests_threshold);
+        let (dispatcher, sender) = Self::new(
+            conn_factory,
+            Some(conn),
+            reconnect_interval,
+            internal_simultaneous_requests_threshold,
+        );
+        Ok((dispatcher.run(), sender))
+    }
 
-        Ok((
+    /// Wire a dispatcher to the sender the client uses.
+    fn new(
+        conn_factory: ConnFactory,
+        conn: Option<Connection>,
+        reconnect_interval: Option<ReconnectInterval>,
+        queue_size: usize,
+    ) -> (Self, DispatcherSender) {
+        let (tx, rx) = mpsc::channel(queue_size);
+        let generation = Arc::new(AtomicU64::new(0));
+        (
             Self {
                 rx: ReceiverStream::new(rx),
-                conn: Some(conn),
+                conn,
                 conn_factory,
                 reconnect_interval,
-            }
-            .run(),
-            DispatcherSender { tx },
-        ))
+                generation: generation.clone(),
+            },
+            DispatcherSender { tx, generation },
+        )
     }
 
     async fn reconnect(&mut self) {
@@ -146,6 +192,9 @@ impl Dispatcher {
         loop {
             match (self.conn_factory)().await {
                 Ok(conn) => {
+                    // The handshake already refreshed the shared features;
+                    // bump before `run` lets requests onto the new connection.
+                    self.generation.fetch_add(1, Ordering::AcqRel);
                     self.conn = Some(conn);
                     return;
                 }
@@ -253,6 +302,43 @@ impl From<&ReconnectInterval> for ReconnectIntervalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use parking_lot::RwLock;
+
+    use super::super::connection::tests::{echo_sync, spawn_fake_server};
+    use crate::codec::request::ConnectionFeatures;
+
+    /// Dispatcher with no live connection whose factory connects to `addr`.
+    fn dispatcher_for(
+        addr: String,
+        reconnect_interval: Option<ReconnectInterval>,
+    ) -> (Dispatcher, DispatcherSender) {
+        let features = Arc::new(RwLock::new(ConnectionFeatures::default()));
+        Dispatcher::new(
+            Box::new(move || {
+                let addr = addr.clone();
+                let features = features.clone();
+                Box::pin(
+                    async move { Connection::new(addr, None, None, None, 16, &features).await },
+                ) as Pin<Box<ConnectDynFuture>>
+            }),
+            None,
+            reconnect_interval,
+            4,
+        )
+    }
+
+    #[tokio::test]
+    async fn reconnect_bumps_generation() {
+        let addr = spawn_fake_server(echo_sync).await;
+        let (mut dispatcher, sender) = dispatcher_for(addr, None);
+        assert_eq!(sender.generation(), 0);
+
+        dispatcher.reconnect().await;
+
+        assert!(dispatcher.conn.is_some());
+        assert_eq!(sender.generation(), 1);
+    }
 
     fn exp_backoff_state(
         min: Duration,

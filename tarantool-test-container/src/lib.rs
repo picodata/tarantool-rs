@@ -3,7 +3,7 @@ pub use testcontainers;
 use std::{borrow::Cow, collections::HashMap};
 
 use testcontainers::{
-    Container, Image,
+    Container, Image, ImageExt,
     core::{ContainerPort, IntoContainerPort, Mount, WaitFor},
     runners::SyncRunner,
 };
@@ -126,6 +126,37 @@ impl TarantoolTestContainer {
         self.container
             .as_ref()
             .expect("container is present until drop")
+    }
+
+    /// Start a container whose port 3301 is published on a fixed host port,
+    /// so the address stays valid across [`Self::restart`] (Docker may pick a
+    /// new ephemeral port when a container with a dynamic mapping restarts).
+    pub fn from_image_with_host_port(image: TarantoolImage, host_port: u16) -> Self {
+        let container =
+            std::thread::spawn(move || image.with_mapped_port(host_port, 3301.tcp()).start())
+                .join()
+                .expect("tarantool container start thread panicked")
+                .expect("failed to start tarantool test container");
+        Self {
+            container: Some(container),
+        }
+    }
+
+    /// Stop the container and start it again. The server process restarts,
+    /// so every client connection to it is dropped. Returns once Docker has
+    /// started the container, not once Tarantool listens again.
+    pub fn restart(&self) {
+        let container = self.container();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    container.stop()?;
+                    container.start()
+                })
+                .join()
+        })
+        .expect("tarantool container restart thread panicked")
+        .expect("failed to restart tarantool test container");
     }
 }
 

@@ -11,6 +11,12 @@ use crate::{Executor, Result, codec::request::EncodedRequest};
 ///
 /// With streams there is a guarantee that the server instance will not handle the next request in a stream until it has completed the previous one ([docs](https://www.tarantool.io/en/doc/latest/dev_guide/internals/box_protocol/#binary-protocol-streams)).
 ///
+/// A stream does not survive a reconnect of the underlying [`Connection`]:
+/// its state lived only on the old server session, and any request made
+/// through it after a reconnect fails with
+/// [`Error::ConnectionReset`][crate::Error::ConnectionReset] instead of
+/// silently continuing on the new connection.
+///
 /// # Example
 ///
 /// ```rust,compile
@@ -45,21 +51,28 @@ use crate::{Executor, Result, codec::request::EncodedRequest};
 #[derive(Clone)]
 pub struct Stream {
     conn: Connection,
-    stream_id: u32,
+    id: u32,
+    generation: u64,
 }
 
 // TODO: convert stream to transaction and back
 impl Stream {
     pub(crate) fn new(conn: Connection) -> Self {
-        let stream_id = conn.next_stream_id();
-        Self { conn, stream_id }
+        let id = conn.next_stream_id();
+        let generation = conn.generation();
+        Self {
+            conn,
+            id,
+            generation,
+        }
     }
 }
 
 #[async_trait]
 impl Executor for Stream {
     async fn send_encoded_request(&self, mut request: EncodedRequest) -> Result<Value> {
-        request.stream_id = Some(self.stream_id);
+        self.conn.check_generation(self.generation)?;
+        request.stream_id = Some(self.id);
         self.conn.send_encoded_request(request).await
     }
 
@@ -83,7 +96,8 @@ impl Executor for Stream {
 impl fmt::Debug for Stream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Stream")
-            .field("stream_id", &self.stream_id)
+            .field("id", &self.id)
+            .field("generation", &self.generation)
             .finish_non_exhaustive()
     }
 }

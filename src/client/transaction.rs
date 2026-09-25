@@ -23,6 +23,7 @@ use crate::{
 pub struct Transaction {
     conn: Connection,
     stream_id: u32,
+    generation: u64,
     finished: bool,
 }
 
@@ -33,9 +34,11 @@ impl Transaction {
         isolation_level: TransactionIsolationLevel,
     ) -> Result<Self> {
         let stream_id = conn.next_stream_id();
+        let generation = conn.generation();
         let this = Self {
             conn,
             stream_id,
+            generation,
             finished: false,
         };
         this.begin(isolation_level, timeout_secs).await?;
@@ -84,21 +87,32 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        if !self.finished {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        // After a reconnect the server already discarded this transaction
+        // together with the old connection; there is nothing to roll back.
+        if self.conn.check_generation(self.generation).is_err() {
             debug!(
-                "Rolling back tranasction on stream {} (on drop)",
+                "Transaction on stream {} was lost with its connection, not rolling back",
                 self.stream_id
             );
-            self.conn
-                .send_request_sync_and_forget(&Rollback::default(), Some(self.stream_id));
-            self.finished = true;
+            return;
         }
+        debug!(
+            "Rolling back tranasction on stream {} (on drop)",
+            self.stream_id
+        );
+        self.conn
+            .send_request_sync_and_forget(&Rollback::default(), Some(self.stream_id));
     }
 }
 
 #[async_trait]
 impl Executor for Transaction {
     async fn send_encoded_request(&self, mut request: EncodedRequest) -> Result<Value> {
+        self.conn.check_generation(self.generation)?;
         request.stream_id = Some(self.stream_id);
         self.conn.send_encoded_request(request).await
     }
@@ -125,6 +139,7 @@ impl fmt::Debug for Transaction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Transaction")
             .field("stream_id", &self.stream_id)
+            .field("generation", &self.generation)
             .field("finished", &self.finished)
             .finish_non_exhaustive()
     }

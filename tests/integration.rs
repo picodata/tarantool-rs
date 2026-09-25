@@ -256,6 +256,61 @@ async fn dmo() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Ping until the client is connected again, failing after `limit`.
+async fn wait_until_reconnected(conn: &Connection, limit: Duration) {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        match conn.ping().await {
+            Ok(()) => return,
+            Err(err) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "client did not reconnect within {limit:?}: {err:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[traced_test]
+async fn restart_mid_transaction_fails_the_stale_transaction() -> Result<(), anyhow::Error> {
+    let container = TarantoolTestContainer::new_restartable();
+    let conn = Connection::builder()
+        .timeout(Duration::from_secs(5))
+        .build(format!("127.0.0.1:{}", container.connect_port()))
+        .await?;
+
+    let tx = conn.transaction().await?;
+    let space = tx
+        .space("reconnect")
+        .await?
+        .expect("Space 'reconnect' found");
+    let _ = space.insert((1u32,)).await?;
+
+    container.restart();
+    // A fresh request succeeding proves the reconnect, including the ID
+    // re-handshake, completed.
+    wait_until_reconnected(&conn, Duration::from_secs(60)).await;
+
+    assert_matches!(space.insert((2u32,)).await, Err(Error::ConnectionReset));
+    drop(space);
+    drop(tx);
+
+    // The torn transaction left nothing behind.
+    let fresh = conn
+        .space("reconnect")
+        .await?
+        .expect("Space 'reconnect' found");
+    let rows: Vec<(u32,)> = fresh
+        .select(None, None, Some(tarantool_rs::IteratorType::All), ())
+        .await?;
+    assert!(rows.is_empty(), "uncommitted insert survived: {rows:?}");
+
+    Ok(())
+}
+
 #[tokio::test]
 #[traced_test]
 async fn upsert_on_existing_tuple_applies_operations() -> Result<(), anyhow::Error> {

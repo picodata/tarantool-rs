@@ -73,6 +73,19 @@ pub enum Error {
     #[error("TCP connection closed")]
     ConnectionClosed,
 
+    /// The connection was re-established after this stream or transaction
+    /// was created, so its state on the server is gone.
+    ///
+    /// This can also happen for a stream or transaction created while a
+    /// reconnect was already in progress: it captures the generation that
+    /// was current at creation time, which is already stale, so its very
+    /// first request fails with this error even though it never had any
+    /// server-side state to lose. Either way, the remedy is the same:
+    /// create a fresh stream or transaction on the (now reconnected)
+    /// `Connection`.
+    #[error("Connection was re-established; stream or transaction state on the server was lost")]
+    ConnectionReset,
+
     /// Other errors that don't deserve a separate variant.
     #[error(transparent)]
     Other(anyhow::Error),

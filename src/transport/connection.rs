@@ -5,6 +5,7 @@ use futures::{
     future::{Fuse, FusedFuture},
 };
 
+use parking_lot::RwLock;
 use tokio::{
     io::AsyncReadExt,
     net::{
@@ -26,7 +27,7 @@ use super::dispatcher::{DispatcherRequest, DispatcherResponse, DispatcherRespons
 use crate::{
     codec::{
         ClientCodec, Greeting,
-        request::{Auth, EncodedRequest},
+        request::{Auth, ConnectionFeatures, EncodedRequest, Id},
         response::{Response, ResponseBody},
     },
     errors::{CodecEncodeError, ConnectionError, Error},
@@ -177,6 +178,7 @@ impl Connection {
         user: Option<&str>,
         password: Option<&str>,
         internal_simultaneous_requests_threshold: usize,
+        features: &RwLock<ConnectionFeatures>,
     ) -> Result<Self, Error>
     where
         A: ToSocketAddrs + Display,
@@ -209,6 +211,13 @@ impl Connection {
             .await?;
         }
 
+        // TODO: add option to disable pre 2.10 features (ID request, streams, watchers)
+        // Runs on every connection, so a reconnect re-negotiates features.
+        let negotiated =
+            Self::id(&mut read_stream, &mut write_stream, conn_data.next_sync()).await?;
+        debug!("Negotiated features: {:?}", negotiated);
+        *features.write() = negotiated;
+
         // TODO: review size of this queue
         // Make this queue slightly larger than queue between Client and Dispatcher
         let (writer_tx, writer_rx) = mpsc::channel(
@@ -238,6 +247,7 @@ impl Connection {
         password: Option<&str>,
         timeout: Option<Duration>,
         internal_simultaneous_requests_threshold: usize,
+        features: &RwLock<ConnectionFeatures>,
     ) -> Result<Self, Error>
     where
         A: ToSocketAddrs + Display,
@@ -250,6 +260,7 @@ impl Connection {
                     user,
                     password,
                     internal_simultaneous_requests_threshold,
+                    features,
                 ),
             )
             .await
@@ -261,6 +272,7 @@ impl Connection {
                     user,
                     password,
                     internal_simultaneous_requests_threshold,
+                    features,
                 )
                 .await
             }
@@ -292,6 +304,33 @@ impl Connection {
         match resp.body {
             ResponseBody::Ok(_x) => Ok(()),
             ResponseBody::Error(err) => Err(Error::Auth(err)),
+        }
+    }
+
+    /// Send `IPROTO_ID` with the features this crate supports and return what
+    /// the server agreed to. Same raw-stream pattern as [`Self::auth`].
+    async fn id(
+        read_stream: &mut FramedRead<OwnedReadHalf, ClientCodec>,
+        write_stream: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
+        sync: u32,
+    ) -> Result<ConnectionFeatures, Error> {
+        let mut request = EncodedRequest::new(&Id::default(), None)?;
+        *request.sync_mut() = sync;
+
+        trace!("Sending ID request");
+        write_stream.send(request).await?;
+
+        let resp = Self::get_next_stream_value(read_stream).await?;
+        if resp.sync != sync {
+            return Err(Error::Other(anyhow::anyhow!(
+                "Unexpected sync {} in ID response, expected {}",
+                resp.sync,
+                sync
+            )));
+        }
+        match resp.body {
+            ResponseBody::Ok(body) => Ok(ConnectionFeatures::decode(&body)?),
+            ResponseBody::Error(err) => Err(Error::Response(err)),
         }
     }
 
@@ -403,11 +442,18 @@ impl Connection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use tokio::{io::AsyncWriteExt, net::TcpListener};
     use tracing_test::traced_test;
 
+    use std::sync::Arc;
+
+    use parking_lot::RwLock;
+    use rmpv::Value;
+
+    use crate::codec::consts::RequestType;
+    use crate::codec::request::ConnectionFeatures;
     use crate::{codec::request::Ping, transport::DispatcherSender};
 
     /// Syntactically valid 128-byte greeting whose salt is 32 zero bytes.
@@ -423,17 +469,88 @@ mod tests {
         buf
     }
 
-    /// Fake server which writes the greeting and then keeps the socket open,
-    /// draining whatever the client sends.
-    async fn spawn_greeting_only_server() -> String {
+    /// Read one request frame sent by the client and return its
+    /// `(request_type, sync)`, or `None` once the client closed the socket.
+    async fn read_request(sock: &mut TcpStream) -> Option<(u8, u32)> {
+        // `ClientCodec` always writes the length as MP_UINT64: 0xcf + 8 bytes.
+        let mut len_buf = [0u8; 9];
+        sock.read_exact(&mut len_buf).await.ok()?;
+        let len = u64::from_be_bytes(len_buf[1..].try_into().unwrap());
+        let mut frame = vec![0u8; usize::try_from(len).unwrap()];
+        sock.read_exact(&mut frame).await.ok()?;
+        let header = rmpv::decode::read_value(&mut &frame[..]).unwrap();
+        let field = |key: u64| {
+            header
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_u64() == Some(key))
+                .and_then(|(_, v)| v.as_u64())
+                .unwrap()
+        };
+        Some((
+            u8::try_from(field(0x00)).unwrap(),
+            u32::try_from(field(0x01)).unwrap(),
+        ))
+    }
+
+    /// Response frame `{RESPONSE_CODE: 0, SYNC: sync, SCHEMA_VERSION: 1}` + `body`.
+    fn ok_response(sync: u32, body: &Value) -> Vec<u8> {
+        let mut payload = Vec::new();
+        rmp::encode::write_map_len(&mut payload, 3).unwrap();
+        rmp::encode::write_pfix(&mut payload, 0x00).unwrap();
+        rmp::encode::write_pfix(&mut payload, 0x00).unwrap();
+        rmp::encode::write_pfix(&mut payload, 0x01).unwrap();
+        rmp::encode::write_u32(&mut payload, sync).unwrap();
+        rmp::encode::write_pfix(&mut payload, 0x05).unwrap();
+        rmp::encode::write_pfix(&mut payload, 0x01).unwrap();
+        rmpv::encode::write_value(&mut payload, body).unwrap();
+        let mut frame = Vec::new();
+        rmp::encode::write_u32(&mut frame, u32::try_from(payload.len()).unwrap()).unwrap();
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Body of an `IPROTO_ID` response: `{VERSION: 3, FEATURES: [0, 1, 2]}`.
+    fn id_response_body() -> Value {
+        Value::Map(vec![
+            (Value::from(0x54u8), Value::from(3u8)),
+            (
+                Value::from(0x55u8),
+                Value::Array(vec![Value::from(0u8), Value::from(1u8), Value::from(2u8)]),
+            ),
+        ])
+    }
+
+    /// `sync_for` that answers every request with its own sync.
+    pub(crate) fn echo_sync(_request_type: u8, sync: u32) -> u32 {
+        sync
+    }
+
+    /// Fake server: writes the greeting, then answers every request with an
+    /// OK response (an `IPROTO_ID` one for ID requests). `sync_for` maps the
+    /// request's `(request_type, sync)` to the sync put into the response, so
+    /// tests can inject a mismatch.
+    pub(crate) async fn spawn_fake_server(sync_for: fn(u8, u32) -> u32) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    let _ = sock.write_all(&fake_greeting()).await;
-                    let mut buf = [0u8; 1024];
-                    while sock.read(&mut buf).await.unwrap_or(0) != 0 {}
+                    if sock.write_all(&fake_greeting()).await.is_err() {
+                        return;
+                    }
+                    while let Some((request_type, sync)) = read_request(&mut sock).await {
+                        let body = if request_type == RequestType::Id as u8 {
+                            id_response_body()
+                        } else {
+                            Value::Map(Vec::new())
+                        };
+                        let response = ok_response(sync_for(request_type, sync), &body);
+                        if sock.write_all(&response).await.is_err() {
+                            return;
+                        }
+                    }
                 });
             }
         });
@@ -452,8 +569,8 @@ mod tests {
 
     #[tokio::test]
     async fn small_threshold_does_not_panic() {
-        let addr = spawn_greeting_only_server().await;
-        let conn = Connection::new_inner(addr, None, None, 50).await;
+        let addr = spawn_fake_server(echo_sync).await;
+        let conn = Connection::new_inner(addr, None, None, 50, &RwLock::default()).await;
         assert!(conn.is_ok());
     }
 
@@ -499,41 +616,64 @@ mod tests {
 
     #[tokio::test]
     async fn default_threshold_does_not_panic() {
-        let addr = spawn_greeting_only_server().await;
-        let conn = Connection::new_inner(addr, None, None, 500).await;
+        let addr = spawn_fake_server(echo_sync).await;
+        let conn = Connection::new_inner(addr, None, None, 500, &RwLock::default()).await;
         assert!(conn.is_ok());
-    }
-
-    /// Fake server which writes the greeting, waits for the AUTH request and
-    /// answers it with an empty OK response carrying `sync`.
-    async fn spawn_auth_server(sync: u8) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            sock.write_all(&fake_greeting()).await.unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await.unwrap();
-            // len 8, {RESPONSE_CODE: 0, SYNC: sync, SCHEMA_VERSION: 1}, {}
-            let resp = [0x08, 0x83, 0x00, 0x00, 0x01, sync, 0x05, 0x01, 0x80];
-            sock.write_all(&resp).await.unwrap();
-            while sock.read(&mut buf).await.unwrap_or(0) != 0 {}
-        });
-        addr
     }
 
     #[tokio::test]
     async fn auth_response_with_matching_sync_is_accepted() {
-        // AUTH is the first request on a connection, so it gets sync 0
-        let addr = spawn_auth_server(0).await;
-        let conn = Connection::new_inner(addr, Some("user"), Some("pass"), 500).await;
+        let addr = spawn_fake_server(echo_sync).await;
+        let conn =
+            Connection::new_inner(addr, Some("user"), Some("pass"), 500, &RwLock::default()).await;
         assert!(conn.is_ok());
     }
 
     #[tokio::test]
     async fn auth_response_with_other_sync_is_rejected() {
-        let addr = spawn_auth_server(42).await;
-        let conn = Connection::new_inner(addr, Some("user"), Some("pass"), 500).await;
+        let addr = spawn_fake_server(|request_type, sync| {
+            if request_type == RequestType::Auth as u8 {
+                42
+            } else {
+                sync
+            }
+        })
+        .await;
+        let conn =
+            Connection::new_inner(addr, Some("user"), Some("pass"), 500, &RwLock::default()).await;
+        assert!(matches!(conn, Err(Error::Other(_))));
+    }
+
+    #[tokio::test]
+    async fn handshake_records_negotiated_features() {
+        let addr = spawn_fake_server(echo_sync).await;
+        let features = RwLock::new(ConnectionFeatures::default());
+        Connection::new_inner(addr, None, None, 500, &features)
+            .await
+            .unwrap();
+        assert_eq!(
+            *features.read(),
+            ConnectionFeatures {
+                protocol_version: 3,
+                streams: true,
+                transactions: true,
+                error_extension: true,
+                watchers: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn id_response_with_other_sync_is_rejected() {
+        let addr = spawn_fake_server(|request_type, sync| {
+            if request_type == RequestType::Id as u8 {
+                42
+            } else {
+                sync
+            }
+        })
+        .await;
+        let conn = Connection::new_inner(addr, None, None, 500, &RwLock::default()).await;
         assert!(matches!(conn, Err(Error::Other(_))));
     }
 
@@ -546,7 +686,7 @@ mod tests {
         let (conn, _server) = connection_with_writer(async { Ok(()) }).await;
         let (client_tx, client_rx) = mpsc::channel::<DispatcherRequest>(1);
         let mut client_rx = ReceiverStream::new(client_rx);
-        let sender = DispatcherSender::new_for_test(client_tx);
+        let sender = DispatcherSender::new_for_test(client_tx, Arc::default());
 
         // `join!` keeps both futures inside the test's tracing span, which
         // `logs_contain` needs; a spawned task would log outside it.

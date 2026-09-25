@@ -1,11 +1,12 @@
-use std::{cmp::max, fmt::Display, time::Duration};
+use std::{cmp::max, fmt::Display, sync::Arc, time::Duration};
 
+use parking_lot::RwLock;
 use tokio::net::ToSocketAddrs;
 use tracing::debug;
 
 use crate::{
     client::Connection,
-    codec::{consts::TransactionIsolationLevel, request::Id},
+    codec::{consts::TransactionIsolationLevel, request::ConnectionFeatures},
     errors::Error,
     transport::Dispatcher,
 };
@@ -104,37 +105,40 @@ impl ConnectionBuilder {
     where
         A: ToSocketAddrs + Display + Clone + Send + Sync + 'static,
     {
-        let (dispatcher_fut, disaptcher_sender) = Dispatcher::prepare(
+        let features = Arc::new(RwLock::new(ConnectionFeatures::default()));
+        let (dispatcher_fut, dispatcher_sender) = Dispatcher::prepare(
             addr,
             self.user.as_deref(),
             self.password.as_deref(),
             self.connect_timeout,
             self.reconnect_interval.clone(),
             self.internal_simultaneous_requests_threshold,
+            features.clone(),
         )
         .await?;
 
         // TODO: support setting custom executor
         tokio::spawn(dispatcher_fut);
         let conn = Connection::new(
-            disaptcher_sender,
+            dispatcher_sender,
             self.timeout,
             self.transaction_timeout,
             self.transaction_isolation_level,
             self.sql_statement_cache_capacity,
+            features,
         );
 
-        // TODO: add option to disable pre 2.10 features (ID request, streams, watchers)
-        let features = Id::default();
+        // The IPROTO_ID handshake runs inside every transport connection, so
+        // the features are negotiated by the time `prepare` returns.
+        let negotiated = conn.features();
         debug!(
-            "Setting supported features: VERSION - {}, STREAMS - {}, TRANSACTIONS - {}, ERROR_EXTENSION - {}, WATCHERS = {}",
-            features.protocol_version,
-            features.streams,
-            features.transactions,
-            features.error_extension,
-            features.watchers
+            "Negotiated features: VERSION - {}, STREAMS - {}, TRANSACTIONS - {}, ERROR_EXTENSION - {}, WATCHERS - {}",
+            negotiated.protocol_version,
+            negotiated.streams,
+            negotiated.transactions,
+            negotiated.error_extension,
+            negotiated.watchers
         );
-        conn.id(features).await?;
 
         Ok(conn)
     }

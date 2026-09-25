@@ -11,18 +11,18 @@ use std::{
 use async_trait::async_trait;
 use futures::TryFutureExt;
 use lru::LruCache;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rmpv::Value;
 use tokio::time::timeout;
 use tracing::{debug, trace};
 
 use crate::{
-    ExecutorExt, Result,
+    Error, ExecutorExt, Result,
     builder::ConnectionBuilder,
     client::{Executor, Stream, Transaction, TransactionBuilder},
     codec::{
         consts::TransactionIsolationLevel,
-        request::{EncodedRequest, Id, Request},
+        request::{ConnectionFeatures, EncodedRequest, Request},
         response::ResponseBody,
     },
     transport::DispatcherSender,
@@ -35,6 +35,13 @@ use crate::{
 ///
 /// Underling implemenation could reconnect automatically (depending on builder configuration),
 /// and could do pooling in the future (not yet implemented!).
+///
+/// Automatic reconnect only ever affects plain, stateless requests sent
+/// directly through a `Connection`. A [`Stream`] or [`Transaction`] created
+/// from it does not survive a reconnect: its state lived only on the old
+/// server session, so a request made through it afterwards fails with
+/// [`Error::ConnectionReset`] instead of silently rebinding to the new
+/// connection.
 #[derive(Clone)]
 pub struct Connection {
     inner: Arc<ConnectionInner>,
@@ -42,6 +49,8 @@ pub struct Connection {
 
 struct ConnectionInner {
     dispatcher_sender: DispatcherSender,
+    /// Written by the transport after every `IPROTO_ID` handshake.
+    features: Arc<RwLock<ConnectionFeatures>>,
     // TODO: change how stream id assigned when dispatcher have more than one connection
     next_stream_id: AtomicU32,
     timeout: Option<Duration>,
@@ -67,10 +76,12 @@ impl Connection {
         transaction_timeout: Option<Duration>,
         transaction_isolation_level: TransactionIsolationLevel,
         sql_statement_cache_capacity: usize,
+        features: Arc<RwLock<ConnectionFeatures>>,
     ) -> Self {
         Self {
             inner: Arc::new(ConnectionInner {
                 dispatcher_sender,
+                features,
                 // TODO: check if 0 is valid value
                 next_stream_id: AtomicU32::new(1),
                 timeout,
@@ -110,10 +121,27 @@ impl Connection {
         }
     }
 
-    // TODO: return response from server
-    /// Send ID request ([docs](https://www.tarantool.io/en/doc/latest/dev_guide/internals/box_protocol/#iproto-id-0x49)).
-    pub(crate) async fn id(&self, features: Id) -> Result<()> {
-        self.send_request(features).await.map(drop)
+    /// Features negotiated by the most recent `IPROTO_ID` handshake.
+    pub(crate) fn features(&self) -> ConnectionFeatures {
+        self.inner.features.read().clone()
+    }
+
+    /// Generation of the underlying transport connection.
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.dispatcher_sender.generation()
+    }
+
+    /// Fail with [`Error::ConnectionReset`] if the transport connection was
+    /// re-established since `captured` was read.
+    ///
+    /// Advisory: a request can pass this check and still cross a reconnect;
+    /// the dying connection then answers it with `ConnectionClosed`.
+    pub(crate) fn check_generation(&self, captured: u64) -> Result<()> {
+        if self.generation() == captured {
+            Ok(())
+        } else {
+            Err(Error::ConnectionReset)
+        }
     }
 
     pub(crate) fn stream(&self) -> Stream {
@@ -217,20 +245,63 @@ impl fmt::Debug for Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::atomic::AtomicU64;
+
     use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::{
+        codec::{consts::RequestType, response::Response},
+        transport::DispatcherRequest,
+    };
+
+    fn test_connection(
+        tx: mpsc::Sender<DispatcherRequest>,
+        generation: Arc<AtomicU64>,
+        request_timeout: Option<Duration>,
+    ) -> Connection {
+        Connection::new(
+            DispatcherSender::new_for_test(tx, generation),
+            request_timeout,
+            None,
+            TransactionIsolationLevel::default(),
+            10,
+            Arc::new(RwLock::new(ConnectionFeatures::default())),
+        )
+    }
+
+    fn ok_body(_request_type: u8) -> ResponseBody {
+        ResponseBody::Ok(Value::Map(Vec::new()))
+    }
+
+    /// Fake dispatcher: answers every request with `reply(request_type)` and
+    /// records the `(request_type, stream_id)` of every request it receives.
+    #[allow(clippy::type_complexity)]
+    fn spawn_fake_dispatcher(
+        mut rx: mpsc::Receiver<DispatcherRequest>,
+        reply: fn(u8) -> ResponseBody,
+    ) -> Arc<Mutex<Vec<(u8, Option<u32>)>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_task = seen.clone();
+        tokio::spawn(async move {
+            while let Some((request, responder)) = rx.recv().await {
+                let request_type = request.request_type as u8;
+                seen_by_task.lock().push((request_type, request.stream_id));
+                let _ = responder.send(Ok(Response {
+                    sync: request.sync,
+                    schema_version: 1,
+                    body: reply(request_type),
+                }));
+            }
+        });
+        seen
+    }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn sql_statement_is_not_prepared_while_another_is_in_flight() {
         let (tx, mut rx) = mpsc::channel(8);
-        let conn = Connection::new(
-            DispatcherSender::new_for_test(tx),
-            None,
-            None,
-            TransactionIsolationLevel::default(),
-            10,
-        );
+        let conn = test_connection(tx, Arc::default(), None);
 
         let update_lock = conn.inner.sql_statement_cache_update_lock.lock();
         let res = timeout(
@@ -243,5 +314,67 @@ mod tests {
 
         assert_eq!(res, None);
         assert!(rx.try_recv().is_err(), "PREPARE request was sent");
+    }
+
+    #[tokio::test]
+    async fn stale_stream_fails_with_connection_reset() {
+        let (tx, rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let conn = test_connection(tx, generation.clone(), None);
+        let seen = spawn_fake_dispatcher(rx, ok_body);
+
+        let stream = conn.stream();
+        stream.ping().await.unwrap();
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        let res = stream.ping().await;
+        assert!(matches!(res, Err(Error::ConnectionReset)), "{res:?}");
+        assert_eq!(seen.lock().len(), 1, "the stale request was sent");
+    }
+
+    #[tokio::test]
+    async fn stale_transaction_fails_and_skips_drop_rollback() {
+        let (tx, rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let conn = test_connection(tx, generation.clone(), None);
+        let seen = spawn_fake_dispatcher(rx, ok_body);
+
+        let transaction = conn.transaction().await.unwrap();
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        let res = transaction.ping().await;
+        assert!(matches!(res, Err(Error::ConnectionReset)), "{res:?}");
+        drop(transaction);
+        // Give a drop-time rollback, if any, the chance to reach the dispatcher.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*seen.lock(), vec![(RequestType::Begin as u8, Some(1))]);
+    }
+
+    #[tokio::test]
+    async fn plain_request_ignores_generation() {
+        let (tx, rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let conn = test_connection(tx, generation.clone(), None);
+        let seen = spawn_fake_dispatcher(rx, ok_body);
+
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        conn.ping().await.unwrap();
+        assert_eq!(*seen.lock(), vec![(RequestType::Ping as u8, None)]);
+    }
+
+    #[tokio::test]
+    async fn stream_created_after_reconnect_is_not_stale() {
+        let (tx, rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let conn = test_connection(tx, generation.clone(), None);
+        let _seen = spawn_fake_dispatcher(rx, ok_body);
+
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        conn.stream().ping().await.unwrap();
+        let transaction = conn.transaction().await.unwrap();
+        transaction.ping().await.unwrap();
+        transaction.commit().await.unwrap();
     }
 }
