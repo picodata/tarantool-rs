@@ -84,6 +84,9 @@ impl DispatcherResponseSender {
 pub(crate) struct DispatcherSender {
     tx: mpsc::Sender<DispatcherMessage>,
     generation: Arc<AtomicU64>,
+    /// Dropped together with the last client handle; the dispatcher awaits
+    /// that through [`Dispatcher::client_liveness`].
+    _liveness: oneshot::Receiver<()>,
 }
 
 impl DispatcherSender {
@@ -92,7 +95,12 @@ impl DispatcherSender {
         tx: mpsc::Sender<DispatcherMessage>,
         generation: Arc<AtomicU64>,
     ) -> Self {
-        Self { tx, generation }
+        let (_client_liveness, liveness) = oneshot::channel();
+        Self {
+            tx,
+            generation,
+            _liveness: liveness,
+        }
     }
 
     /// Generation of the transport connection; see [`Dispatcher::generation`].
@@ -140,9 +148,19 @@ impl DispatcherSender {
 type ConnectDynFuture = dyn Future<Output = Result<Connection, Error>> + Send;
 type ConnFactory = Box<dyn Fn() -> Pin<Box<ConnectDynFuture>> + Send + Sync>;
 
+/// How [`Dispatcher::reconnect`] ended.
+enum ReconnectOutcome {
+    /// A new connection is in `Dispatcher::conn`.
+    Connected,
+    /// Every client handle was dropped; the dispatcher should stop.
+    ClientsGone,
+}
+
 /// Dispatching messages from client to connection.
 ///
-/// Currently no-op, in future it should handle reconnects, schema reloading, pooling.
+/// Owns the reconnect loop, bumps the shared generation counter on every
+/// successful reconnect, and exits once the last client handle is dropped.
+/// Schema reloading and pooling are not implemented yet.
 pub(crate) struct Dispatcher {
     rx: ReceiverStream<DispatcherMessage>,
     conn: Option<Connection>,
@@ -152,6 +170,9 @@ pub(crate) struct Dispatcher {
     /// new connection. Streams and transactions compare it with the value
     /// they captured at creation.
     generation: Arc<AtomicU64>,
+    /// Its `closed()` resolves once every client handle is gone, even while
+    /// no connection is reading `rx`.
+    client_liveness: oneshot::Sender<()>,
 }
 
 impl Dispatcher {
@@ -208,6 +229,7 @@ impl Dispatcher {
     ) -> (Self, DispatcherSender) {
         let (tx, rx) = mpsc::channel(queue_size);
         let generation = Arc::new(AtomicU64::new(0));
+        let (client_liveness, liveness) = oneshot::channel();
         (
             Self {
                 rx: ReceiverStream::new(rx),
@@ -215,29 +237,43 @@ impl Dispatcher {
                 conn_factory,
                 reconnect_interval,
                 generation: generation.clone(),
+                client_liveness,
             },
-            DispatcherSender { tx, generation },
+            DispatcherSender {
+                tx,
+                generation,
+                _liveness: liveness,
+            },
         )
     }
 
-    async fn reconnect(&mut self) {
+    async fn reconnect(&mut self) -> ReconnectOutcome {
         let mut reconn_int_state = self
             .reconnect_interval
             .as_ref()
             .map(ReconnectIntervalState::from);
         loop {
-            match (self.conn_factory)().await {
+            let attempt = tokio::select! {
+                res = (self.conn_factory)() => res,
+                () = self.client_liveness.closed() => return ReconnectOutcome::ClientsGone,
+            };
+            match attempt {
                 Ok(conn) => {
                     // The handshake already refreshed the shared features;
                     // bump before `run` lets requests onto the new connection.
                     self.generation.fetch_add(1, Ordering::AcqRel);
                     self.conn = Some(conn);
-                    return;
+                    return ReconnectOutcome::Connected;
                 }
                 Err(err) => {
                     error!("Failed to reconnect to Tarantool: {:#}", err);
                     if let Some(ref mut x) = reconn_int_state {
-                        tokio::time::sleep(x.next_timeout()).await;
+                        tokio::select! {
+                            () = tokio::time::sleep(x.next_timeout()) => {}
+                            () = self.client_liveness.closed() => {
+                                return ReconnectOutcome::ClientsGone;
+                            }
+                        }
                     }
                 }
             }
@@ -253,8 +289,11 @@ impl Dispatcher {
                         return;
                     }
                 }
-                _ => {
-                    self.reconnect().await;
+                None => {
+                    if let ReconnectOutcome::ClientsGone = self.reconnect().await {
+                        debug!("All client handles dropped, stopping dispatcher");
+                        return;
+                    }
                 }
             }
         }
@@ -340,6 +379,7 @@ mod tests {
     use super::*;
 
     use parking_lot::RwLock;
+    use tokio::net::TcpListener;
 
     use super::super::connection::tests::{echo_sync, spawn_fake_server};
     use crate::codec::request::ConnectionFeatures;
@@ -364,13 +404,48 @@ mod tests {
         )
     }
 
+    /// Address nothing listens on: connects to it are refused.
+    async fn dead_endpoint() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn dispatcher_exits_when_last_client_handle_is_dropped_during_reconnect() {
+        // `None` is the hot loop: no backoff sleep to race against.
+        for reconnect_interval in [
+            Some(ReconnectInterval::fixed(Duration::from_millis(10))),
+            None,
+        ] {
+            let (dispatcher, sender) =
+                dispatcher_for(dead_endpoint().await, reconnect_interval.clone());
+            let handle = tokio::spawn(dispatcher.run());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            drop(sender);
+
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "dispatcher kept reconnecting after the last client handle was dropped \
+                         (reconnect_interval = {reconnect_interval:?})"
+                    )
+                })
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn reconnect_bumps_generation() {
         let addr = spawn_fake_server(echo_sync).await;
         let (mut dispatcher, sender) = dispatcher_for(addr, None);
         assert_eq!(sender.generation(), 0);
 
-        dispatcher.reconnect().await;
+        assert!(matches!(
+            dispatcher.reconnect().await,
+            ReconnectOutcome::Connected
+        ));
 
         assert!(dispatcher.conn.is_some());
         assert_eq!(sender.generation(), 1);
