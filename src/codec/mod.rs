@@ -1,5 +1,5 @@
 use anyhow::Context;
-use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
+use base64::{Engine, engine::general_purpose::STANDARD_PAD_INDIFFERENT};
 use bytes::{Buf, BufMut, BytesMut};
 use rmp::Marker;
 use tokio_util::codec::{Decoder, Encoder};
@@ -168,14 +168,9 @@ impl Greeting {
     pub fn decode(buffer: [u8; Self::SIZE]) -> Result<Self, Error> {
         let line1 = &buffer[0..62];
         let line2 = &buffer[64..126];
-        let salt_b64 = line2
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|x| *x.1 != b' ')
-            .map_or(&b""[..], |(idx, _)| &line2[0..idx]);
-        let salt = STANDARD_NO_PAD
-            .decode(salt_b64)
+        // The salt is padded with spaces; its base64 may or may not be padded.
+        let salt = STANDARD_PAD_INDIFFERENT
+            .decode(line2.trim_ascii_end())
             .context("Failed to decode salt from base64")
             .map_err(Error::Other)?;
         Ok(Self {
@@ -188,6 +183,28 @@ impl Greeting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn greeting_with_salt(salt_b64: &[u8]) -> [u8; Greeting::SIZE] {
+        let mut buf = [b' '; Greeting::SIZE];
+        buf[64..64 + salt_b64.len()].copy_from_slice(salt_b64);
+        buf
+    }
+
+    #[test]
+    fn greeting_salt_is_decoded_in_full() {
+        // base64 of 32 zero bytes: 43 'A' followed by '='
+        let mut padded = [b'A'; 44];
+        padded[43] = b'=';
+        let greeting = Greeting::decode(greeting_with_salt(&padded)).unwrap();
+        assert_eq!(greeting.salt, vec![0u8; 32]);
+
+        // base64 without padding keeps its last character
+        let greeting = Greeting::decode(greeting_with_salt(b"AAAA")).unwrap();
+        assert_eq!(greeting.salt, vec![0u8; 3]);
+
+        let greeting = Greeting::decode(greeting_with_salt(b"AA==")).unwrap();
+        assert_eq!(greeting.salt, vec![0u8; 1]);
+    }
 
     #[test]
     fn length_decoder_accepts_exactly_complete_length() {
