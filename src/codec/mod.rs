@@ -46,21 +46,20 @@ impl LengthDecoder {
         let length = match marker {
             Marker::FixPos(x) => x as usize,
             Marker::U8 => {
-                if src.len() > 1 {
-                    src.get_u8() as usize
-                } else {
+                if src.is_empty() {
                     return Ok(None);
                 }
+                src.get_u8() as usize
             }
             Marker::U16 => {
-                if src.len() > 2 {
+                if src.len() >= 2 {
                     src.get_u16() as usize
                 } else {
                     return Ok(None);
                 }
             }
             Marker::U32 => {
-                if src.len() > 4 {
+                if src.len() >= 4 {
                     src.get_u32() as usize
                 } else {
                     return Ok(None);
@@ -70,7 +69,7 @@ impl LengthDecoder {
             #[allow(clippy::cast_possible_truncation)]
             Marker::U64 => {
                 //
-                if src.len() > 8 {
+                if src.len() >= 8 {
                     src.get_u64() as usize
                 } else {
                     return Ok(None);
@@ -183,5 +182,37 @@ impl Greeting {
             server: String::from_utf8_lossy(line1).into_owned(),
             salt,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn length_decoder_accepts_exactly_complete_length() {
+        for (bytes, expected) in [
+            (&[0xccu8, 0x05][..], 5),
+            (&[0xcd, 0x00, 0x05][..], 5),
+            (&[0xce, 0x00, 0x00, 0x00, 0x05][..], 5),
+            (
+                &[0xcf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05][..],
+                5,
+            ),
+        ] {
+            let mut dec = LengthDecoder::default();
+            let mut src = BytesMut::from(bytes);
+            assert_eq!(dec.decode(&mut src).unwrap(), Some(expected), "{bytes:x?}");
+            assert!(src.is_empty());
+        }
+    }
+
+    #[test]
+    fn length_decoder_waits_for_incomplete_length() {
+        let mut dec = LengthDecoder::default();
+        let mut src = BytesMut::from(&[0xceu8, 0x00, 0x00, 0x00][..]);
+        assert_eq!(dec.decode(&mut src).unwrap(), None);
+        src.extend_from_slice(&[0x05]);
+        assert_eq!(dec.decode(&mut src).unwrap(), Some(5));
     }
 }
