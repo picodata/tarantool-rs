@@ -108,7 +108,7 @@ impl ConnectionBuilder {
             addr,
             self.user.as_deref(),
             self.password.as_deref(),
-            self.timeout,
+            self.connect_timeout,
             self.reconnect_interval.clone(),
             self.internal_simultaneous_requests_threshold,
         )
@@ -222,5 +222,29 @@ impl ConnectionBuilder {
     pub fn internal_simultaneous_requests_threshold(&mut self, value: usize) -> &mut Self {
         self.internal_simultaneous_requests_threshold = value;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn connect_timeout_is_applied() {
+        // Listener which never sends the greeting
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            Connection::builder()
+                .connect_timeout(Duration::from_millis(100))
+                .build(addr),
+        )
+        .await
+        .expect("connect_timeout was not applied");
+        assert!(matches!(res, Err(Error::ConnectTimeout)), "{res:?}");
+        drop(listener);
     }
 }
