@@ -142,6 +142,9 @@ impl Connection {
     /// Only one statement can be prepared at the time. All other will immediately
     /// return None, when there is already a statement being prepared. Eventually
     /// all statements should be allowed to prepare.
+    // Update lock is only taken with `try_lock`, so holding it across `await`
+    // never blocks other tasks.
+    #[allow(clippy::await_holding_lock)]
     async fn get_cached_sql_statement_id_inner(&self, statement: &str) -> Option<u64> {
         // Lock cache mutex (if cache is not None) and check
         // if statement present in cache.
@@ -153,7 +156,7 @@ impl Connection {
         // If statement not found, try to lock update lock mutex.
         // If successful, proceed with preparing SQL statement,
         // otherwise return None.
-        let update_lock = self.inner.sql_statement_cache_update_lock.try_lock();
+        let update_lock = self.inner.sql_statement_cache_update_lock.try_lock()?;
         let stmt_id = {
             let stmt_id = match self.prepare_sql(statement).await {
                 Ok(x) => {
@@ -209,5 +212,36 @@ impl Executor for Connection {
 impl fmt::Debug for Connection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Connection")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sql_statement_is_not_prepared_while_another_is_in_flight() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let conn = Connection::new(
+            DispatcherSender::new_for_test(tx),
+            None,
+            None,
+            TransactionIsolationLevel::default(),
+            10,
+        );
+
+        let update_lock = conn.inner.sql_statement_cache_update_lock.lock();
+        let res = timeout(
+            Duration::from_secs(1),
+            conn.get_cached_sql_statement_id_inner("SELECT 1"),
+        )
+        .await
+        .expect("did not return immediately while another statement is being prepared");
+        drop(update_lock);
+
+        assert_eq!(res, None);
+        assert!(rx.try_recv().is_err(), "PREPARE request was sent");
     }
 }

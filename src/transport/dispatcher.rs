@@ -65,6 +65,11 @@ pub(crate) struct DispatcherSender {
 }
 
 impl DispatcherSender {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(tx: mpsc::Sender<DispatcherRequest>) -> Self {
+        Self { tx }
+    }
+
     pub(crate) async fn send(&self, request: EncodedRequest) -> Result<Response, Error> {
         let mut request = Some(request);
         loop {
