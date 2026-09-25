@@ -1,5 +1,4 @@
-use std::io::Read;
-
+use rmp::decode::DecodeStringError;
 use tracing::{debug, error};
 
 use super::consts::response_codes::{ERROR_RANGE_END, ERROR_RANGE_START, OK};
@@ -29,7 +28,7 @@ impl Response {
     // Use [`anyhow::Error`] because any error would mean either entirely broken
     // implementation of protocol or underlying I/O error, which currently would be
     // implementation bug as well.
-    pub(super) fn decode(mut buf: impl Read) -> Result<Self, DecodingError> {
+    pub(super) fn decode(mut buf: &[u8]) -> Result<Self, DecodingError> {
         let map_len = rmp::decode::read_map_len(&mut buf)?;
         let mut response_code: Option<u32> = None;
         let mut sync: Option<u32> = None;
@@ -77,19 +76,11 @@ impl Response {
                     let key: u8 = rmp::decode::read_pfix(&mut buf)?;
                     match key {
                         keys::ERROR_24 => {
-                            // TODO: rewrite string decoding
-                            let str_len = rmp::decode::read_str_len(&mut buf)?;
-                            let mut str_buf = vec![0; str_len as usize];
-                            buf.read_exact(&mut str_buf).map_err(|err| {
-                                DecodingError::message_pack(err).in_key("ERROR_24")
-                            })?;
-                            // TODO: find a way to to this safe
-                            description = Some(String::from_utf8(str_buf).map_err(|_err| {
-                                DecodingError::message_pack(anyhow::anyhow!(
-                                    "String is not valid UTF-8 string"
-                                ))
-                                .in_key("ERROR_24")
-                            })?);
+                            // Checks the bound and UTF-8 without a copy.
+                            let (text, rest) = rmp::decode::read_str_from_slice(buf)
+                                .map_err(|err| error_24_error(buf, &err).in_key("ERROR_24"))?;
+                            description = Some(text.to_owned());
+                            buf = rest;
                         }
                         keys::ERROR => {
                             extra = Some(rmpv::decode::read_value(&mut buf)?);
@@ -116,5 +107,68 @@ impl Response {
             schema_version,
             body,
         })
+    }
+}
+
+/// Error for an `ERROR_24` string that `read_str_from_slice` rejected. The
+/// library's own `Display` is a fixed text, so the bound keeps its message.
+fn error_24_error<E: rmp::decode::RmpReadErr>(
+    buf: &[u8],
+    err: &DecodeStringError<'_, E>,
+) -> DecodingError {
+    match err {
+        DecodeStringError::BufferSizeTooSmall(len) => {
+            // Count the bytes after the string's header.
+            let mut data = buf;
+            let _ = rmp::decode::read_str_len(&mut data);
+            DecodingError::message_pack(anyhow::anyhow!(
+                "string length {len} exceeds remaining {} bytes",
+                data.len()
+            ))
+        }
+        DecodeStringError::InvalidUtf8(_, _) => {
+            DecodingError::message_pack(anyhow::anyhow!("String is not valid UTF-8 string"))
+        }
+        other => DecodingError::message_pack(anyhow::anyhow!("{other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::DecodingErrorDetails;
+
+    fn error_response(description: &[u8]) -> Vec<u8> {
+        // {RESPONSE_CODE: 0x8001, SYNC: 1, SCHEMA_VERSION: 1}
+        let mut frame = vec![0x83, 0x00, 0xcd, 0x80, 0x01, 0x01, 0x01, 0x05, 0x01];
+        // {ERROR_24: <description>}
+        frame.extend_from_slice(&[0x81, 0x31]);
+        frame.extend_from_slice(description);
+        frame
+    }
+
+    #[test]
+    fn error_description_length_is_bounded_by_frame() {
+        // str32 announcing u32::MAX bytes, followed by only 3 bytes
+        let frame = error_response(&[0xdb, 0xff, 0xff, 0xff, 0xff, b'a', b'b', b'c']);
+        let err = Response::decode(&frame[..]).unwrap_err();
+        let DecodingErrorDetails::MessagePack(inner) = err.kind() else {
+            panic!("unexpected error kind: {err:?}");
+        };
+        assert!(
+            inner.to_string().contains("exceeds remaining"),
+            "unexpected error: {inner}"
+        );
+    }
+
+    #[test]
+    fn error_description_is_decoded() {
+        let frame = error_response(&[0xa3, b'a', b'b', b'c']);
+        let resp = Response::decode(&frame[..]).unwrap();
+        let ResponseBody::Error(err) = resp.body else {
+            panic!("expected error body");
+        };
+        assert_eq!(err.code, 1);
+        assert_eq!(err.description, "abc");
     }
 }

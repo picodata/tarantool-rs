@@ -114,7 +114,7 @@ impl Decoder for ClientCodec {
         if src.len() >= next_frame_length {
             self.length_decoder.reset();
             let frame_bytes = src.split_to(next_frame_length);
-            Response::decode(frame_bytes.reader())
+            Response::decode(&frame_bytes)
                 .map(Some)
                 .map_err(CodecDecodeError::Decode)
         } else {
