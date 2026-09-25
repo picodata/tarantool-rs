@@ -33,7 +33,7 @@ impl<O: Tuple, T: Tuple> Request for Upsert<O, T> {
     where
         Self: Sized,
     {
-        RequestType::Replace
+        RequestType::Upsert
     }
 
     // TODO: test whether index_base is mandatory

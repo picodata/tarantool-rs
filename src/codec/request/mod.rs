@@ -102,3 +102,30 @@ impl EncodedRequest {
         &mut self.sync
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_is_sent_as_upsert() {
+        let req = EncodedRequest::new(&Upsert::new(512, ((),), ((),)), None).unwrap();
+        assert_eq!(req.request_type as u8, RequestType::Upsert as u8);
+    }
+
+    #[test]
+    fn other_dmo_request_types_are_correct() {
+        assert_eq!(
+            EncodedRequest::new(&Insert::new(512, ((),)), None)
+                .unwrap()
+                .request_type as u8,
+            RequestType::Insert as u8
+        );
+        assert_eq!(
+            EncodedRequest::new(&Replace::new(512, ((),)), None)
+                .unwrap()
+                .request_type as u8,
+            RequestType::Replace as u8
+        );
+    }
+}

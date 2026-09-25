@@ -3,7 +3,7 @@ use std::time::Duration;
 use assert_matches::assert_matches;
 use rmpv::Value;
 use serde::{Deserialize, Serialize};
-use tarantool_rs::{Connection, Executor, ExecutorExt, errors::Error};
+use tarantool_rs::{Connection, DmoOperation, Executor, ExecutorExt, errors::Error};
 use tracing_test::traced_test;
 
 use crate::common::{TarantoolTestContainer, TarantoolTestContainerExt};
@@ -252,6 +252,39 @@ async fn dmo() -> Result<(), anyhow::Error> {
         .decode()?;
 
     tx.commit().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn upsert_on_existing_tuple_applies_operations() -> Result<(), anyhow::Error> {
+    let container = TarantoolTestContainer::new_with_test_data();
+    let conn = container.create_conn().await?;
+    let space = conn
+        .space("ds9_crew")
+        .await?
+        .expect("Space 'ds9_crew' found");
+
+    // A REPLACE would store this tuple verbatim. An UPSERT on an existing key
+    // must ignore the tuple and apply the operations instead.
+    let _ = space
+        .upsert(
+            (1u32, "Replaced", "Replaced", "Replaced"),
+            (DmoOperation::assign(2u32, "Captain"),),
+        )
+        .await?;
+
+    let members: Vec<CrewMember> = space.select(None, None, None, (1u32,)).await?;
+    assert_eq!(
+        members,
+        vec![CrewMember {
+            id: 1,
+            name: "Benjamin Sisko".into(),
+            rank: "Captain".into(),
+            occupation: "Commanding officer".into()
+        }]
+    );
 
     Ok(())
 }
