@@ -295,6 +295,13 @@ impl Connection {
         write_stream.send(request).await?;
 
         let resp = Self::get_next_stream_value(read_stream).await?;
+        if resp.sync != sync {
+            return Err(Error::Other(anyhow::anyhow!(
+                "Unexpected sync {} in auth response, expected {}",
+                resp.sync,
+                sync
+            )));
+        }
         match resp.body {
             ResponseBody::Ok(_x) => Ok(()),
             ResponseBody::Error(err) => Err(Error::Auth(err)),
@@ -519,5 +526,38 @@ mod tests {
         let addr = spawn_greeting_only_server().await;
         let conn = Connection::new_inner(addr, None, None, 500).await;
         assert!(conn.is_ok());
+    }
+
+    /// Fake server which writes the greeting, waits for the AUTH request and
+    /// answers it with an empty OK response carrying `sync`.
+    async fn spawn_auth_server(sync: u8) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&fake_greeting()).await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await.unwrap();
+            // len 8, {RESPONSE_CODE: 0, SYNC: sync, SCHEMA_VERSION: 1}, {}
+            let resp = [0x08, 0x83, 0x00, 0x00, 0x01, sync, 0x05, 0x01, 0x80];
+            sock.write_all(&resp).await.unwrap();
+            while sock.read(&mut buf).await.unwrap_or(0) != 0 {}
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn auth_response_with_matching_sync_is_accepted() {
+        // AUTH is the first request on a connection, so it gets sync 0
+        let addr = spawn_auth_server(0).await;
+        let conn = Connection::new_inner(addr, Some("user"), Some("pass"), 500).await;
+        assert!(conn.is_ok());
+    }
+
+    #[tokio::test]
+    async fn auth_response_with_other_sync_is_rejected() {
+        let addr = spawn_auth_server(42).await;
+        let conn = Connection::new_inner(addr, Some("user"), Some("pass"), 500).await;
+        assert!(matches!(conn, Err(Error::Other(_))));
     }
 }
