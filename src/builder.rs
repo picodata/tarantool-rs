@@ -201,7 +201,7 @@ impl ConnectionBuilder {
 
     /// Sets capacity of SQL statment cache.
     ///
-    /// Setting 0 disables cache. By default set to 100.
+    /// Setting 0 disables cache. By default set to 500.
     pub fn sql_statement_cache_capacity(&mut self, capacity: usize) -> &mut Self {
         self.sql_statement_cache_capacity = capacity;
         self
