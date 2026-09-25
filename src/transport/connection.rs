@@ -80,7 +80,6 @@ impl ConnectionData {
                 .in_flights
                 .insert(request.sync, old)
                 .expect("Shouldn't panic, value was just inserted");
-            // TODO: probably could respond with NeedsResend
             if new.send(Error::DuplicatedSync(request.sync)).is_err() {
                 warn!(
                     "Failed to pass error to sync {}, receiver dropped",
@@ -102,7 +101,9 @@ impl ConnectionData {
                 }
             }
             _ => {
-                warn!("Unknown sync {}", sync);
+                // Expected for a response whose caller is gone (for example a
+                // request cancelled after a timeout), so not worth a warning.
+                debug!("Unknown sync {}", sync);
             }
         }
     }
@@ -114,14 +115,6 @@ impl ConnectionData {
             let _ = tx.send(Error::from(err.clone()));
         }
     }
-
-    /// Return requests to be resent
-    #[inline]
-    fn return_requests_to_be_resent(&mut self, requests: Vec<EncodedRequest>) {
-        for x in requests {
-            self.respond_to_client(x.sync, x);
-        }
-    }
 }
 
 // NOTE: here is weird logic, where task can be cancelld using token and when
@@ -130,7 +123,7 @@ async fn writer_task(
     mut rx: mpsc::Receiver<EncodedRequest>,
     mut stream: FramedWrite<OwnedWriteHalf, ClientCodec>,
     cancellation_token: CancellationToken,
-) -> (Result<(), (u32, CodecEncodeError)>, Vec<EncodedRequest>) {
+) -> Result<(), (u32, CodecEncodeError)> {
     let mut result = Ok(());
 
     loop {
@@ -158,23 +151,17 @@ async fn writer_task(
         }
     }
 
-    // Close internal queue and extract all remaining requests
-    rx.close();
     cancellation_token.cancel();
-    let mut remaining_requests = Vec::new();
-    while let Ok(next) = rx.try_recv() {
-        remaining_requests.push(next);
-    }
 
     // TODO: reenable or pass strema back into main task
     // if let Err(err) = stream.into_inner().shutdown().await {
     //     warn!("Failed to shutdown TCP stream cleanly: {err}");
     // }
 
-    (result, remaining_requests)
+    result
 }
 
-type WriterTaskJoinHandle = JoinHandle<(Result<(), (u32, CodecEncodeError)>, Vec<EncodedRequest>)>;
+type WriterTaskJoinHandle = JoinHandle<Result<(), (u32, CodecEncodeError)>>;
 
 pub(crate) struct Connection {
     read_stream: FramedRead<OwnedReadHalf, ClientCodec>,
@@ -344,8 +331,6 @@ impl Connection {
             mut data,
         } = self;
 
-        let mut not_sent_requests = Vec::new();
-
         let send_to_writer_future = Fuse::terminated();
         pin!(send_to_writer_future);
 
@@ -382,16 +367,13 @@ impl Connection {
                 // Await sending request to writer.
                 // NOTE: For some reason checking Fuse for termination makes code _slightly_ faster
                 send_res = &mut send_to_writer_future, if !send_to_writer_future.is_terminated() => {
-                    // Error means writer rx is closed and connection should be terminated.
-                    if let Err(err) = send_res {
-                        not_sent_requests.push(err.0);
+                    // Error means the writer queue is closed and the connection
+                    // must be torn down. The request inside the error is already
+                    // registered in `in_flights`, so the teardown below answers
+                    // its caller with `ConnectionClosed`.
+                    if send_res.is_err() {
                         break Err(ConnectionError::ConnectionClosed)
                     }
-                    // TODO: somehow return EncodedRequest from Err variant, so it can be retried
-
-                    // Do nothing, since on success there is nothing to do,
-                    // and on error we can only response to client with ConnectionClosed,
-                    // which will happen anyway in next branch on next (or so) iteration.
                 }
             }
         };
@@ -403,25 +385,18 @@ impl Connection {
                 error!("Failed to await writer task's handle: {err}");
                 result = result.and(Err(err.into()));
             }
-            Ok((result, not_sent_requests_from_writer)) => {
-                not_sent_requests.extend(not_sent_requests_from_writer);
-
-                if let Err((sync, err)) = result {
-                    data.respond_to_client(sync, Err(err.into()));
-                }
-            }
+            Ok(Err((sync, err))) => data.respond_to_client(sync, Err(err.into())),
+            Ok(Ok(())) => {}
         }
 
-        // Respond to all in flights with error
+        // Every request registered in `in_flights` is answered here, whether it
+        // was queued for the writer, being written, or awaiting its response.
         data.send_error_to_all_in_flights(
             &result
                 .clone()
                 .err()
                 .unwrap_or(ConnectionError::ConnectionClosed),
         );
-
-        // Schedule all not sent requests to resend
-        data.return_requests_to_be_resent(not_sent_requests);
 
         result.map_err(drop)
     }
@@ -431,6 +406,9 @@ impl Connection {
 mod tests {
     use super::*;
     use tokio::{io::AsyncWriteExt, net::TcpListener};
+    use tracing_test::traced_test;
+
+    use crate::{codec::request::Ping, transport::DispatcherSender};
 
     /// Syntactically valid 128-byte greeting whose salt is 32 zero bytes.
     fn fake_greeting() -> [u8; Greeting::SIZE] {
@@ -481,9 +459,7 @@ mod tests {
 
     /// Build a connection over a local socket pair, with a custom writer task.
     async fn connection_with_writer(
-        writer: impl Future<Output = (Result<(), (u32, CodecEncodeError)>, Vec<EncodedRequest>)>
-        + Send
-        + 'static,
+        writer: impl Future<Output = Result<(), (u32, CodecEncodeError)>> + Send + 'static,
     ) -> (Connection, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap())
@@ -514,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_task_clean_exit_is_reported_as_ok() {
-        let (conn, _server) = connection_with_writer(async { (Ok(()), Vec::new()) }).await;
+        let (conn, _server) = connection_with_writer(async { Ok(()) }).await;
         let (client_tx, client_rx) = mpsc::channel::<DispatcherRequest>(1);
         let mut client_rx = ReceiverStream::new(client_rx);
         drop(client_tx);
@@ -559,5 +535,31 @@ mod tests {
         let addr = spawn_auth_server(42).await;
         let conn = Connection::new_inner(addr, Some("user"), Some("pass"), 500).await;
         assert!(matches!(conn, Err(Error::Other(_))));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn teardown_answers_registered_request_without_unknown_sync() {
+        // The writer queue's receiver is already gone, so handing the request
+        // to the writer fails and the connection tears down while the request
+        // is registered in `in_flights`.
+        let (conn, _server) = connection_with_writer(async { Ok(()) }).await;
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherRequest>(1);
+        let mut client_rx = ReceiverStream::new(client_rx);
+        let sender = DispatcherSender::new_for_test(client_tx);
+
+        // `join!` keeps both futures inside the test's tracing span, which
+        // `logs_contain` needs; a spawned task would log outside it.
+        let (run_res, send_res) = tokio::join!(
+            conn.run(&mut client_rx),
+            sender.send(EncodedRequest::new(&Ping {}, None).unwrap()),
+        );
+
+        assert!(run_res.is_err());
+        assert!(
+            matches!(send_res, Err(Error::ConnectionClosed)),
+            "{send_res:?}"
+        );
+        assert!(!logs_contain("Unknown sync"));
     }
 }

@@ -13,12 +13,10 @@ use crate::{
     codec::{request::EncodedRequest, response::Response},
 };
 
-// Arc here is necessary to send same error to all waiting in-flights
 pub(crate) type DispatcherRequest = (EncodedRequest, DispatcherResponseSender);
 
 pub(crate) enum DispatcherResponse {
     Finished(Result<Response, Error>),
-    NeedsResend(EncodedRequest),
 }
 
 impl From<Result<Response, Error>> for DispatcherResponse {
@@ -32,13 +30,6 @@ impl From<Error> for DispatcherResponse {
     #[inline]
     fn from(value: Error) -> Self {
         Self::Finished(Err(value))
-    }
-}
-
-impl From<EncodedRequest> for DispatcherResponse {
-    #[inline]
-    fn from(value: EncodedRequest) -> Self {
-        Self::NeedsResend(value)
     }
 }
 
@@ -71,27 +62,19 @@ impl DispatcherSender {
     }
 
     pub(crate) async fn send(&self, request: EncodedRequest) -> Result<Response, Error> {
-        let mut request = Some(request);
-        loop {
-            let (tx, rx) = oneshot::channel();
-            let tx = DispatcherResponseSender(tx);
-
-            // SAFETY: initial value is put in Option immediately.
-            // On next iterations value is put in Option right before `continue` expression.
-            //
-            // A failed send means the dispatcher task is gone, which is
-            // permanent — retrying would spin forever.
-            if self.tx.send((request.take().unwrap(), tx)).await.is_err() {
-                return Err(Error::ConnectionClosed);
-            }
-
-            match rx.await {
-                Ok(DispatcherResponse::Finished(x)) => return x,
-                Ok(DispatcherResponse::NeedsResend(x)) => {
-                    request = Some(x);
-                }
-                Err(_) => return Err(Error::ConnectionClosed),
-            }
+        let (tx, rx) = oneshot::channel();
+        // A failed send means the dispatcher task is gone, which is permanent.
+        if self
+            .tx
+            .send((request, DispatcherResponseSender(tx)))
+            .await
+            .is_err()
+        {
+            return Err(Error::ConnectionClosed);
+        }
+        match rx.await {
+            Ok(DispatcherResponse::Finished(x)) => x,
+            Err(_) => Err(Error::ConnectionClosed),
         }
     }
 }
