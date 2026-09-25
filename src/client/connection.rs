@@ -46,6 +46,15 @@ pub struct Connection {
     inner: Arc<ConnectionInner>,
 }
 
+/// SQL statement cache together with the generation it was last touched
+/// under. Tarantool checks prepared-statement ids per session, so a
+/// reconnect (a new session) invalidates every id the cache holds; a
+/// generation mismatch on lookup is treated as a full cache miss.
+struct SqlStatementCache {
+    generation: u64,
+    cache: LruCache<String, u64>,
+}
+
 struct ConnectionInner {
     dispatcher_sender: DispatcherSender,
     /// Written by the transport after every `IPROTO_ID` handshake.
@@ -62,7 +71,7 @@ struct ConnectionInner {
     async_rt_handle: tokio::runtime::Handle,
     // TODO: tests
     // TODO: move sql statement cache to separate type
-    sql_statement_cache: Option<Mutex<LruCache<String, u64>>>,
+    sql_statement_cache: Option<Mutex<SqlStatementCache>>,
     sql_statement_cache_update_lock: Mutex<()>,
 }
 
@@ -94,8 +103,12 @@ impl Connection {
                 // NOTE: Safety: this method can be called only in async tokio context (because it
                 // is called only from ConnectionBuilder).
                 async_rt_handle: tokio::runtime::Handle::current(),
-                sql_statement_cache: NonZeroUsize::new(sql_statement_cache_capacity)
-                    .map(|x| Mutex::new(LruCache::new(x))),
+                sql_statement_cache: NonZeroUsize::new(sql_statement_cache_capacity).map(|x| {
+                    Mutex::new(SqlStatementCache {
+                        generation: 0,
+                        cache: LruCache::new(x),
+                    })
+                }),
                 sql_statement_cache_update_lock: Mutex::new(()),
             }),
         }
@@ -224,11 +237,24 @@ impl Connection {
     // never blocks other tasks.
     #[allow(clippy::await_holding_lock)]
     async fn get_cached_sql_statement_id_inner(&self, statement: &str) -> Option<u64> {
-        // Lock cache mutex (if cache is not None) and check
-        // if statement present in cache.
+        // Lock cache mutex (if cache is not None) and check if statement is
+        // present in cache. Tarantool checks prepared-statement ids per
+        // session, so a reconnect since the cache was last touched means
+        // every id it holds is stale; drop the whole cache instead of
+        // trusting it, and treat this lookup as a miss.
         let cache = self.inner.sql_statement_cache.as_ref()?;
-        if let Some(stmt_id) = cache.lock().get(statement) {
-            return Some(*stmt_id);
+        let current_generation = self.generation();
+        if let Some(stmt_id) = {
+            let mut guard = cache.lock();
+            if guard.generation == current_generation {
+                guard.cache.get(statement).copied()
+            } else {
+                guard.generation = current_generation;
+                guard.cache.clear();
+                None
+            }
+        } {
+            return Some(stmt_id);
         }
 
         // If statement not found, try to lock update lock mutex.
@@ -247,7 +273,7 @@ impl Connection {
                     return None;
                 }
             };
-            let _ = cache.lock().put(statement.into(), stmt_id);
+            let _ = cache.lock().cache.put(statement.into(), stmt_id);
             stmt_id
         };
         drop(update_lock);
@@ -316,6 +342,19 @@ mod tests {
 
     fn ok_body(_request_type: u8) -> ResponseBody {
         ResponseBody::Ok(Value::Map(Vec::new()))
+    }
+
+    /// Answers every request OK; a `Prepare` request gets a fixed
+    /// `SQL_STMT_ID` so the response decodes into a prepared statement.
+    fn prepare_ok_body(request_type: u8) -> ResponseBody {
+        if request_type == RequestType::Prepare as u8 {
+            ResponseBody::Ok(Value::Map(vec![(
+                Value::from(crate::codec::consts::keys::SQL_STMT_ID),
+                Value::from(42u64),
+            )]))
+        } else {
+            ok_body(request_type)
+        }
     }
 
     fn reject_commit_and_rollback(request_type: u8) -> ResponseBody {
@@ -586,6 +625,43 @@ mod tests {
 
         conn.ping().await.unwrap();
         assert_eq!(*seen.lock(), vec![(RequestType::Ping as u8, None)]);
+    }
+
+    #[tokio::test]
+    async fn cached_sql_statement_id_is_invalidated_after_reconnect() {
+        let (tx, rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let conn = test_connection(tx, generation.clone(), None);
+        let seen = spawn_fake_dispatcher(rx, prepare_ok_body);
+        let prepares = || {
+            seen.lock()
+                .iter()
+                .filter(|(request_type, _)| *request_type == RequestType::Prepare as u8)
+                .count()
+        };
+
+        let stmt_id = conn
+            .get_cached_sql_statement_id_inner("SELECT 1")
+            .await
+            .expect("first lookup prepares and caches the statement");
+        assert_eq!(prepares(), 1);
+
+        // Cached: a second lookup for the same text does not send PREPARE
+        // again while the generation is unchanged.
+        assert_eq!(
+            conn.get_cached_sql_statement_id_inner("SELECT 1").await,
+            Some(stmt_id)
+        );
+        assert_eq!(prepares(), 1);
+
+        // A reconnect invalidates every cached id (Tarantool checks
+        // prepared-statement ids per session), so the same statement text
+        // triggers a new PREPARE instead of reusing the stale id.
+        generation.fetch_add(1, Ordering::SeqCst);
+        conn.get_cached_sql_statement_id_inner("SELECT 1")
+            .await
+            .expect("statement is re-prepared after a reconnect");
+        assert_eq!(prepares(), 2, "cached statement id survived a reconnect");
     }
 
     #[tokio::test]
