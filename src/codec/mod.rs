@@ -135,12 +135,17 @@ impl Encoder<EncodedRequest> for ClientCodec {
         // TODO: calculate necessary integer type instead of using u64 always
         // Write message with fictional length (0)
         let mut writer = dst.writer();
-        rmp::encode::write_u64(&mut writer, 0)
-            .map_err(|err| CodecEncodeError::Encode(err.into()))?;
-        item.encode(&mut writer).map_err(CodecEncodeError::Encode)?;
+        let res = rmp::encode::write_u64(&mut writer, 0)
+            .map_err(|err| CodecEncodeError::Encode(err.into()))
+            .and_then(|()| item.encode(&mut writer).map_err(CodecEncodeError::Encode));
+        let dst = writer.into_inner();
+        if let Err(err) = res {
+            // Do not leave partially written frame in the buffer
+            dst.truncate(begin_idx);
+            return Err(err);
+        }
 
         // Calculate length and override length field with actual value
-        let dst = writer.into_inner();
         let data_len = dst.len() - begin_idx - 9;
         let mut len_writer = dst[begin_idx..].writer();
         rmp::encode::write_u64(&mut len_writer, data_len as u64)
@@ -188,6 +193,17 @@ mod tests {
         let mut buf = [b' '; Greeting::SIZE];
         buf[64..64 + salt_b64.len()].copy_from_slice(salt_b64);
         buf
+    }
+
+    #[test]
+    fn encoded_frame_length_matches_body() {
+        let mut dst = BytesMut::from(&b"prefix"[..]);
+        let req = EncodedRequest::new(&request::Ping {}, None).unwrap();
+        ClientCodec::default().encode(req, &mut dst).unwrap();
+        assert_eq!(&dst[..6], b"prefix");
+        assert_eq!(dst[6], 0xcf);
+        let len = u64::from_be_bytes(dst[7..15].try_into().unwrap());
+        assert_eq!(len, (dst.len() - 15) as u64);
     }
 
     #[test]
