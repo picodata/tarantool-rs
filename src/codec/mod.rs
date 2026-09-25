@@ -16,6 +16,10 @@ pub mod request;
 pub mod response;
 pub mod utils;
 
+/// Most bytes reserved up front for one response frame. A longer frame grows
+/// the buffer as its bytes arrive.
+const MAX_FRAME_RESERVE: usize = 64 * 1024 * 1024;
+
 #[derive(Default)]
 enum LengthDecoder {
     #[default]
@@ -44,33 +48,30 @@ impl LengthDecoder {
         // Safety: `src.get_uXX` might panic if there is no enough data,
         // but in this case we check before reading, so it shouldn't panic.
         let length = match marker {
-            Marker::FixPos(x) => x as usize,
+            Marker::FixPos(x) => u64::from(x),
             Marker::U8 => {
                 if src.is_empty() {
                     return Ok(None);
                 }
-                src.get_u8() as usize
+                u64::from(src.get_u8())
             }
             Marker::U16 => {
                 if src.len() >= 2 {
-                    src.get_u16() as usize
+                    u64::from(src.get_u16())
                 } else {
                     return Ok(None);
                 }
             }
             Marker::U32 => {
                 if src.len() >= 4 {
-                    src.get_u32() as usize
+                    u64::from(src.get_u32())
                 } else {
                     return Ok(None);
                 }
             }
-            // Payload length of a sane message fits in usize on all supported targets.
-            #[allow(clippy::cast_possible_truncation)]
             Marker::U64 => {
-                //
                 if src.len() >= 8 {
-                    src.get_u64() as usize
+                    src.get_u64()
                 } else {
                     return Ok(None);
                 }
@@ -82,6 +83,16 @@ impl LengthDecoder {
                 ));
             }
         };
+        // Tarantool writes every response length as MP_UINT32, so a longer one
+        // is garbage. The bound also keeps the conversion below lossless on
+        // 32-bit targets.
+        if length > u64::from(u32::MAX) {
+            return Err(DecodingError::message_pack(anyhow::anyhow!(
+                "frame length {length} exceeds maximum of {} bytes",
+                u32::MAX
+            )));
+        }
+        let length = usize::try_from(length).map_err(DecodingError::message_pack)?;
         trace!("decoded frame length: {}", length);
         *self = LengthDecoder::Value(length);
         Ok(Some(length))
@@ -117,7 +128,9 @@ impl Decoder for ClientCodec {
                 .map(Some)
                 .map_err(CodecDecodeError::Decode)
         } else {
-            src.reserve(next_frame_length - src.len());
+            // `FramedRead` reserves again before every read, so a frame longer
+            // than the up-front reserve grows the buffer as its bytes arrive.
+            src.reserve((next_frame_length - src.len()).min(MAX_FRAME_RESERVE));
             Ok(None)
         }
     }
@@ -247,5 +260,41 @@ mod tests {
         assert_eq!(dec.decode(&mut src).unwrap(), None);
         src.extend_from_slice(&[0x05]);
         assert_eq!(dec.decode(&mut src).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn oversized_frame_length_is_rejected() {
+        // 0xcf = MP u64 marker. Tarantool never sends a length above
+        // u32::MAX, so both are garbage.
+        for length in [u64::MAX, u64::from(u32::MAX) + 1] {
+            let mut codec = ClientCodec::default();
+            let mut src = BytesMut::from(&[0xcfu8][..]);
+            src.extend_from_slice(&length.to_be_bytes());
+            src.extend_from_slice(&[0x00]);
+            assert!(
+                matches!(codec.decode(&mut src), Err(CodecDecodeError::Decode(_))),
+                "length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_frame_waits_for_its_bytes_with_a_bounded_reserve() {
+        // 0xce = MP u32 marker, 0xcf = MP u64 marker; one body byte follows.
+        for header in [
+            [&[0xceu8][..], &(64 * 1024 * 1024 + 1u32).to_be_bytes()].concat(),
+            [&[0xceu8][..], &(128 * 1024 * 1024u32).to_be_bytes()].concat(),
+            [&[0xcfu8][..], &u64::from(u32::MAX).to_be_bytes()].concat(),
+        ] {
+            let mut codec = ClientCodec::default();
+            let mut src = BytesMut::from(&header[..]);
+            src.extend_from_slice(&[0x00]);
+            assert!(matches!(codec.decode(&mut src), Ok(None)), "{header:x?}");
+            let spare = src.capacity() - src.len();
+            assert!(
+                spare <= 64 * 1024 * 1024,
+                "{header:x?}: {spare} bytes reserved up front"
+            );
+        }
     }
 }

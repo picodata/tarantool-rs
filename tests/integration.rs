@@ -373,3 +373,29 @@ async fn dmo_insert_operation_inserts_a_field() -> Result<(), anyhow::Error> {
 
     Ok(())
 }
+
+// No `#[traced_test]`: the codec logs every response body at debug level, and
+// capturing a 70 MiB body would only slow the test down.
+#[tokio::test]
+async fn response_above_64_mib_is_received() -> Result<(), anyhow::Error> {
+    const LEN: usize = 70 * 1024 * 1024;
+    let container = TarantoolTestContainer::new_with_test_data();
+    let conn = container.create_conn().await?;
+    // Both live on the server session: a reconnect would make them stale.
+    let stream = conn.stream();
+    let tx = conn.transaction().await?;
+
+    let (big, ping) = tokio::join!(
+        conn.eval("return string.rep('x', ...)", (LEN,)),
+        conn.ping(),
+    );
+    let big: String = big?.decode_first()?;
+    assert_eq!(big.len(), LEN);
+    ping?;
+
+    stream.ping().await?;
+    tx.ping().await?;
+    tx.commit().await?;
+
+    Ok(())
+}

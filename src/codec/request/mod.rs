@@ -48,6 +48,28 @@ pub const PROTOCOL_VERSION: u8 = 3;
 const DEFAULT_ENCODE_BUFFER_SIZE: usize = 128;
 const INDEX_BASE_VALUE: u32 = 0;
 
+/// Longest request frame Tarantool accepts, `IPROTO_PACKET_SIZE_MAX` (2 GiB).
+/// The server closes the connection on a longer one.
+const MAX_REQUEST_FRAME_LEN: usize = 1 << 31;
+
+/// Longest header a request can get: a map of four keys whose values are the
+/// request type (2 bytes), the sync (up to 9), the schema version (5) and the
+/// stream id (5). The sync and the stream id are set after
+/// [`EncodedRequest::new`], so it counts the widest ones.
+const MAX_HEADER_LEN: usize = 1 + (1 + 2) + (1 + 9) + (1 + 5) + (1 + 5);
+
+/// Fail when a frame whose size prefix would carry `frame_len` is longer than
+/// Tarantool accepts.
+fn check_request_frame_len(frame_len: usize) -> Result<(), EncodingError> {
+    if frame_len > MAX_REQUEST_FRAME_LEN {
+        return Err(EncodingError::MessagePack(anyhow::anyhow!(
+            "request frame of {frame_len} bytes exceeds Tarantool's limit of \
+             {MAX_REQUEST_FRAME_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
 // TODO: docs
 pub trait Request {
     /// Return type of this request.
@@ -81,12 +103,16 @@ impl EncodedRequest {
     pub fn new<Body: Request>(body: &Body, stream_id: Option<u32>) -> Result<Self, EncodingError> {
         let mut buf = BytesMut::with_capacity(DEFAULT_ENCODE_BUFFER_SIZE).writer();
         body.encode(&mut buf)?;
+        let encoded_body = buf.into_inner().freeze();
+        // Only this request fails. Sent, it would make the server close the
+        // connection and fail every request in flight.
+        check_request_frame_len(MAX_HEADER_LEN.saturating_add(encoded_body.len()))?;
         Ok(Self {
             request_type: Body::request_type(),
             sync: 0,
             schema_version: None,
             stream_id,
-            encoded_body: buf.into_inner().freeze(),
+            encoded_body,
         })
     }
 
@@ -124,6 +150,15 @@ mod tests {
     fn upsert_is_sent_as_upsert() {
         let req = EncodedRequest::new(&Upsert::new(512, ((),), ((),)), None).unwrap();
         assert_eq!(req.request_type as u8, RequestType::Upsert as u8);
+    }
+
+    #[test]
+    fn request_frame_limit_is_tarantools_2_gib() {
+        assert!(check_request_frame_len(1 << 31).is_ok());
+        assert!(matches!(
+            check_request_frame_len((1 << 31) + 1),
+            Err(EncodingError::MessagePack(_))
+        ));
     }
 
     #[test]
