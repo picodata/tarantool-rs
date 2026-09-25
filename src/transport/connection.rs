@@ -50,7 +50,7 @@ impl ConnectionData {
     #[inline]
     fn next_sync(&mut self) -> u32 {
         let next = self.next_sync;
-        self.next_sync += 1;
+        self.next_sync = self.next_sync.wrapping_add(1);
         next
     }
 
@@ -452,6 +452,16 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[test]
+    fn next_sync_wraps_around() {
+        let mut data = ConnectionData {
+            next_sync: u32::MAX,
+            ..ConnectionData::default()
+        };
+        assert_eq!(data.next_sync(), u32::MAX);
+        assert_eq!(data.next_sync(), 0);
     }
 
     #[tokio::test]
