@@ -104,8 +104,11 @@ impl Drop for Transaction {
             "Rolling back tranasction on stream {} (on drop)",
             self.stream_id
         );
-        self.conn
-            .send_request_sync_and_forget(&Rollback::default(), Some(self.stream_id));
+        self.conn.send_request_sync_and_forget(
+            &Rollback::default(),
+            Some(self.stream_id),
+            Some(self.generation),
+        );
     }
 }
 
@@ -114,7 +117,9 @@ impl Executor for Transaction {
     async fn send_encoded_request(&self, mut request: EncodedRequest) -> Result<Value> {
         self.conn.check_generation(self.generation)?;
         request.stream_id = Some(self.stream_id);
-        self.conn.send_encoded_request(request).await
+        self.conn
+            .send_with_generation(request, Some(self.generation))
+            .await
     }
 
     // TODO: do we need to repeat this in all ConnetionLike implementations?

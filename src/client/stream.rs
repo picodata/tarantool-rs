@@ -73,7 +73,9 @@ impl Executor for Stream {
     async fn send_encoded_request(&self, mut request: EncodedRequest) -> Result<Value> {
         self.conn.check_generation(self.generation)?;
         request.stream_id = Some(self.id);
-        self.conn.send_encoded_request(request).await
+        self.conn
+            .send_with_generation(request, Some(self.generation))
+            .await
     }
 
     fn stream(&self) -> Stream {

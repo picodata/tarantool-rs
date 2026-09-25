@@ -68,9 +68,9 @@ pub trait Request {
 /// Request, encoded into MessagePack, and its meta data.
 #[doc(hidden)]
 pub struct EncodedRequest {
-    /// By default `sync` is set to 0 and replaced with
-    /// actual value when reaching [`crate::transport::Connection`].
     pub(crate) request_type: RequestType,
+    /// By default `sync` is set to 0 and replaced with the client-assigned
+    /// value by [`crate::Connection`] before the request is sent.
     pub(crate) sync: u32,
     pub(crate) schema_version: Option<u32>,
     pub(crate) stream_id: Option<u32>,

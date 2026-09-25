@@ -9,7 +9,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::TryFutureExt;
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use rmpv::Value;
@@ -53,6 +52,10 @@ struct ConnectionInner {
     features: Arc<RwLock<ConnectionFeatures>>,
     // TODO: change how stream id assigned when dispatcher have more than one connection
     next_stream_id: AtomicU32,
+    /// Sync of the next request. IPROTO only needs syncs to be unique among
+    /// requests in flight on one TCP connection, which a single wrapping
+    /// counter shared by all generations satisfies.
+    next_sync: AtomicU32,
     timeout: Option<Duration>,
     transaction_timeout_secs: Option<f64>,
     transaction_isolation_level: TransactionIsolationLevel,
@@ -84,6 +87,7 @@ impl Connection {
                 features,
                 // TODO: check if 0 is valid value
                 next_stream_id: AtomicU32::new(1),
+                next_sync: AtomicU32::new(1),
                 timeout,
                 transaction_timeout_secs: transaction_timeout.as_ref().map(Duration::as_secs_f64),
                 transaction_isolation_level,
@@ -99,14 +103,19 @@ impl Connection {
 
     /// Synchronously send request to channel and drop response.
     #[allow(clippy::let_underscore_future)]
-    pub(crate) fn send_request_sync_and_forget(&self, body: &impl Request, stream_id: Option<u32>) {
+    pub(crate) fn send_request_sync_and_forget(
+        &self,
+        body: &impl Request,
+        stream_id: Option<u32>,
+        generation: Option<u64>,
+    ) {
         let this = self.clone();
         let req = EncodedRequest::new(body, stream_id);
         let _ = self.inner.async_rt_handle.spawn(async move {
-            let res = futures::future::ready(req)
-                .err_into()
-                .and_then(|x| this.send_encoded_request(x))
-                .await;
+            let res = match req {
+                Ok(req) => this.send_with_generation(req, generation).await,
+                Err(err) => Err(err.into()),
+            };
             debug!("Response for background request: {:?}", res);
         });
     }
@@ -118,6 +127,45 @@ impl Connection {
             next
         } else {
             self.inner.next_stream_id.fetch_add(1, Ordering::Relaxed)
+        }
+    }
+
+    /// Allocate the sync for the next request.
+    pub(crate) fn next_sync(&self) -> u32 {
+        // `fetch_add` on atomics wraps around on overflow.
+        self.inner.next_sync.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Send `request` with a client-assigned sync.
+    ///
+    /// `generation` is the value a `Stream` or `Transaction` captured at
+    /// creation, `None` for plain requests. The transport answers a request
+    /// whose generation is no longer current with [`Error::ConnectionReset`]
+    /// instead of sending it, which also covers requests that were already
+    /// waiting in the dispatcher queue when a reconnect happened.
+    pub(crate) async fn send_with_generation(
+        &self,
+        mut request: EncodedRequest,
+        generation: Option<u64>,
+    ) -> Result<Value> {
+        let sync = self.next_sync();
+        *request.sync_mut() = sync;
+        let fut = self.inner.dispatcher_sender.send(request, generation);
+        let resp = match self.inner.timeout {
+            Some(x) => match timeout(x, fut).await {
+                Ok(resp) => resp?,
+                Err(elapsed) => {
+                    // Nobody will read the response any more; let the
+                    // transport forget the in-flight entry.
+                    self.inner.dispatcher_sender.cancel(sync);
+                    return Err(elapsed.into());
+                }
+            },
+            None => fut.await?,
+        };
+        match resp.body {
+            ResponseBody::Ok(x) => Ok(x),
+            ResponseBody::Error(x) => Err(x.into()),
         }
     }
 
@@ -134,8 +182,10 @@ impl Connection {
     /// Fail with [`Error::ConnectionReset`] if the transport connection was
     /// re-established since `captured` was read.
     ///
-    /// Advisory: a request can pass this check and still cross a reconnect;
-    /// the dying connection then answers it with `ConnectionClosed`.
+    /// Fast path only: the transport repeats the comparison when it accepts
+    /// the request (see [`Self::send_with_generation`]), which catches the
+    /// requests that pass this check and then wait out a reconnect in the
+    /// dispatcher queue.
     pub(crate) fn check_generation(&self, captured: u64) -> Result<()> {
         if self.generation() == captured {
             Ok(())
@@ -209,15 +259,7 @@ impl Connection {
 #[async_trait]
 impl Executor for Connection {
     async fn send_encoded_request(&self, request: EncodedRequest) -> Result<Value> {
-        let fut = self.inner.dispatcher_sender.send(request);
-        let resp = match self.inner.timeout {
-            Some(x) => timeout(x, fut).await??,
-            None => fut.await?,
-        };
-        match resp.body {
-            ResponseBody::Ok(x) => Ok(x),
-            ResponseBody::Error(x) => Err(x.into()),
-        }
+        self.send_with_generation(request, None).await
     }
 
     fn stream(&self) -> Stream {
@@ -252,11 +294,11 @@ mod tests {
     use super::*;
     use crate::{
         codec::{consts::RequestType, response::Response},
-        transport::DispatcherRequest,
+        transport::{ClientRequest, DispatcherMessage},
     };
 
     fn test_connection(
-        tx: mpsc::Sender<DispatcherRequest>,
+        tx: mpsc::Sender<DispatcherMessage>,
         generation: Arc<AtomicU64>,
         request_timeout: Option<Duration>,
     ) -> Connection {
@@ -276,15 +318,22 @@ mod tests {
 
     /// Fake dispatcher: answers every request with `reply(request_type)` and
     /// records the `(request_type, stream_id)` of every request it receives.
+    /// Cancel messages are ignored.
     #[allow(clippy::type_complexity)]
     fn spawn_fake_dispatcher(
-        mut rx: mpsc::Receiver<DispatcherRequest>,
+        mut rx: mpsc::Receiver<DispatcherMessage>,
         reply: fn(u8) -> ResponseBody,
     ) -> Arc<Mutex<Vec<(u8, Option<u32>)>>> {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_by_task = seen.clone();
         tokio::spawn(async move {
-            while let Some((request, responder)) = rx.recv().await {
+            while let Some(message) = rx.recv().await {
+                let DispatcherMessage::Request(ClientRequest {
+                    request, responder, ..
+                }) = message
+                else {
+                    continue;
+                };
                 let request_type = request.request_type as u8;
                 seen_by_task.lock().push((request_type, request.stream_id));
                 let _ = responder.send(Ok(Response {
@@ -295,6 +344,130 @@ mod tests {
             }
         });
         seen
+    }
+
+    #[tokio::test]
+    async fn requests_carry_client_assigned_syncs() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+
+        let dispatcher = async {
+            let mut syncs = Vec::new();
+            for _ in 0..2 {
+                let Some(DispatcherMessage::Request(ClientRequest {
+                    request, responder, ..
+                })) = rx.recv().await
+                else {
+                    panic!("expected a request");
+                };
+                syncs.push(request.sync);
+                let _ = responder.send(Ok(Response {
+                    sync: request.sync,
+                    schema_version: 1,
+                    body: ok_body(0),
+                }));
+            }
+            syncs
+        };
+        let pings = async {
+            conn.ping().await.unwrap();
+            conn.ping().await.unwrap();
+        };
+        let ((), syncs) = tokio::join!(pings, dispatcher);
+
+        assert_eq!(syncs, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn next_sync_wraps_around() {
+        let (tx, _rx) = mpsc::channel(1);
+        let conn = test_connection(tx, Arc::default(), None);
+        conn.inner.next_sync.store(u32::MAX, Ordering::Relaxed);
+        assert_eq!(conn.next_sync(), u32::MAX);
+        assert_eq!(conn.next_sync(), 0);
+    }
+
+    #[tokio::test]
+    async fn timed_out_request_cancels_its_sync() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), Some(Duration::from_millis(50)));
+
+        let dispatcher = async {
+            let Some(DispatcherMessage::Request(ClientRequest {
+                request, responder, ..
+            })) = rx.recv().await
+            else {
+                panic!("expected the request first");
+            };
+            // Hold the responder so the request never completes.
+            let message = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("no cancel after the timeout");
+            let Some(DispatcherMessage::Cancel(cancelled)) = message else {
+                panic!("expected a cancel after the timeout");
+            };
+            drop(responder);
+            (request.sync, cancelled)
+        };
+        let (res, (sent, cancelled)) = tokio::join!(conn.ping(), dispatcher);
+
+        assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
+        assert_eq!(sent, cancelled);
+    }
+
+    #[tokio::test]
+    async fn timeout_with_full_dispatcher_queue_drops_the_cancel() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let conn = test_connection(tx.clone(), Arc::default(), Some(Duration::from_millis(50)));
+        // Fill the queue so neither the request nor its cancel fits.
+        assert!(tx.try_send(DispatcherMessage::Cancel(u32::MAX)).is_ok());
+
+        let res = timeout(Duration::from_secs(1), conn.ping())
+            .await
+            .expect("a timed-out request blocked on its cancel");
+
+        assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DispatcherMessage::Cancel(u32::MAX))
+        ));
+        assert!(rx.try_recv().is_err(), "a message was queued past capacity");
+    }
+
+    #[tokio::test]
+    async fn stream_requests_carry_their_generation() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::new(AtomicU64::new(3)), None);
+
+        let dispatcher = async {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let Some(DispatcherMessage::Request(ClientRequest {
+                    request,
+                    generation,
+                    responder,
+                })) = rx.recv().await
+                else {
+                    panic!("expected a request");
+                };
+                seen.push((request.stream_id.is_some(), generation));
+                let _ = responder.send(Ok(Response {
+                    sync: request.sync,
+                    schema_version: 1,
+                    body: ok_body(0),
+                }));
+            }
+            seen
+        };
+        let requests = async {
+            conn.stream().ping().await.unwrap();
+            conn.ping().await.unwrap();
+        };
+        let ((), seen) = tokio::join!(requests, dispatcher);
+
+        // The stream request carries the generation it was issued under; the
+        // plain request carries none and is never rejected for staleness.
+        assert_eq!(seen, vec![(true, Some(3)), (false, None)]);
     }
 
     #[tokio::test]

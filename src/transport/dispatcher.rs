@@ -26,7 +26,24 @@ use crate::{
     },
 };
 
-pub(crate) type DispatcherRequest = (EncodedRequest, DispatcherResponseSender);
+/// Request from the client together with the channel its response goes to.
+pub(crate) struct ClientRequest {
+    pub(crate) request: EncodedRequest,
+    /// Generation the issuing `Stream` or `Transaction` captured at
+    /// creation; `None` for plain stateless requests. The transport answers
+    /// a request whose generation is no longer current with
+    /// `Error::ConnectionReset` instead of sending it.
+    pub(crate) generation: Option<u64>,
+    pub(crate) responder: DispatcherResponseSender,
+}
+
+/// Message from the client side to the dispatcher.
+pub(crate) enum DispatcherMessage {
+    /// Send the request and route its response back.
+    Request(ClientRequest),
+    /// The caller gave up on the request with this sync; forget it.
+    Cancel(u32),
+}
 
 pub(crate) enum DispatcherResponse {
     Finished(Result<Response, Error>),
@@ -47,7 +64,7 @@ impl From<Error> for DispatcherResponse {
 }
 
 #[repr(transparent)]
-pub(crate) struct DispatcherResponseSender(oneshot::Sender<DispatcherResponse>);
+pub(crate) struct DispatcherResponseSender(pub(super) oneshot::Sender<DispatcherResponse>);
 
 impl DispatcherResponseSender {
     #[inline]
@@ -65,14 +82,14 @@ impl DispatcherResponseSender {
 }
 
 pub(crate) struct DispatcherSender {
-    tx: mpsc::Sender<DispatcherRequest>,
+    tx: mpsc::Sender<DispatcherMessage>,
     generation: Arc<AtomicU64>,
 }
 
 impl DispatcherSender {
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        tx: mpsc::Sender<DispatcherRequest>,
+        tx: mpsc::Sender<DispatcherMessage>,
         generation: Arc<AtomicU64>,
     ) -> Self {
         Self { tx, generation }
@@ -83,12 +100,20 @@ impl DispatcherSender {
         self.generation.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn send(&self, request: EncodedRequest) -> Result<Response, Error> {
+    pub(crate) async fn send(
+        &self,
+        request: EncodedRequest,
+        generation: Option<u64>,
+    ) -> Result<Response, Error> {
         let (tx, rx) = oneshot::channel();
         // A failed send means the dispatcher task is gone, which is permanent.
         if self
             .tx
-            .send((request, DispatcherResponseSender(tx)))
+            .send(DispatcherMessage::Request(ClientRequest {
+                request,
+                generation,
+                responder: DispatcherResponseSender(tx),
+            }))
             .await
             .is_err()
         {
@@ -97,6 +122,17 @@ impl DispatcherSender {
         match rx.await {
             Ok(DispatcherResponse::Finished(x)) => x,
             Err(_) => Err(Error::ConnectionClosed),
+        }
+    }
+
+    /// Tell the dispatcher that nobody awaits the response for `sync` any more.
+    ///
+    /// Best-effort: if the channel is full or closed the message is dropped,
+    /// and the entry lives until its response arrives or the connection is
+    /// recycled.
+    pub(crate) fn cancel(&self, sync: u32) {
+        if let Err(err) = self.tx.try_send(DispatcherMessage::Cancel(sync)) {
+            debug!("Failed to cancel sync {sync}: {err}");
         }
     }
 }
@@ -108,7 +144,7 @@ type ConnFactory = Box<dyn Fn() -> Pin<Box<ConnectDynFuture>> + Send + Sync>;
 ///
 /// Currently no-op, in future it should handle reconnects, schema reloading, pooling.
 pub(crate) struct Dispatcher {
-    rx: ReceiverStream<DispatcherRequest>,
+    rx: ReceiverStream<DispatcherMessage>,
     conn: Option<Connection>,
     conn_factory: ConnFactory,
     reconnect_interval: Option<ReconnectInterval>,
@@ -213,7 +249,7 @@ impl Dispatcher {
         loop {
             match self.conn.take() {
                 Some(conn) => {
-                    if conn.run(&mut self.rx).await.is_ok() {
+                    if conn.run(&mut self.rx, &self.generation).await.is_ok() {
                         return;
                     }
                 }

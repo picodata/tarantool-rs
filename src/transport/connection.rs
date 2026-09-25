@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fmt::Display, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use futures::{
     FutureExt, SinkExt, StreamExt, TryStreamExt,
@@ -23,7 +28,9 @@ use tokio_util::{
 };
 use tracing::{debug, error, trace, warn};
 
-use super::dispatcher::{DispatcherRequest, DispatcherResponse, DispatcherResponseSender};
+use super::dispatcher::{
+    ClientRequest, DispatcherMessage, DispatcherResponse, DispatcherResponseSender,
+};
 use crate::{
     codec::{
         ClientCodec, Greeting,
@@ -33,49 +40,67 @@ use crate::{
     errors::{CodecEncodeError, ConnectionError, Error},
 };
 
+/// Sync of the AUTH and ID handshake requests. Nothing else is in flight
+/// during the handshake and both responses are read synchronously, so it
+/// cannot collide with the client-assigned syncs used afterwards.
+const HANDSHAKE_SYNC: u32 = 0;
+
 struct ConnectionData {
     in_flights: HashMap<u32, DispatcherResponseSender>,
-    next_sync: u32,
 }
 
 impl Default for ConnectionData {
     fn default() -> Self {
         Self {
             in_flights: HashMap::with_capacity(5),
-            next_sync: 0,
         }
     }
 }
 
 impl ConnectionData {
-    #[inline]
-    fn next_sync(&mut self) -> u32 {
-        let next = self.next_sync;
-        self.next_sync = self.next_sync.wrapping_add(1);
-        next
-    }
-
-    /// Prepare request for sending to server.
+    /// Register the response sender for a request whose sync the client
+    /// already assigned.
     ///
-    /// Set `sync` value and attempt to store this message in in-flight storage.
+    /// A request carrying a generation other than `current_generation` was
+    /// issued through a stream or transaction created on an earlier
+    /// connection, typically while it waited in the dispatcher queue during a
+    /// reconnect. Its server-side state is gone, so it is answered with
+    /// `Error::ConnectionReset` and neither registered nor sent. Requests
+    /// without a generation are never rejected here.
     ///
-    /// `Err` means that message was not prepared and should not be sent.
+    /// `Err` means that message was not registered and should not be sent.
     /// This function also take care of reporting error through `tx`.
     #[inline]
     fn try_prepare_request(
         &mut self,
-        request: &mut EncodedRequest,
+        request: &EncodedRequest,
+        generation: Option<u64>,
+        current_generation: u64,
         tx: DispatcherResponseSender,
     ) -> Result<(), ()> {
-        let sync = self.next_sync();
-        *request.sync_mut() = sync;
+        if let Some(captured) = generation
+            && captured != current_generation
+        {
+            debug!(
+                "Rejecting request with sync {} from generation {}, connection is at {}",
+                request.sync, captured, current_generation
+            );
+            if tx.send(Error::ConnectionReset).is_err() {
+                debug!(
+                    "Failed to pass ConnectionReset to sync {}, receiver dropped",
+                    request.sync
+                );
+            }
+            return Err(());
+        }
         trace!(
             "Sending request with sync {}, stream_id {:?}",
             request.sync, request.stream_id
         );
         // TODO: replace with try_insert when stabilized
-        // If sync already assigned to another request, return an error
-        // for current request
+        // Safety net: syncs are unique among in-flight requests by
+        // construction, but a colliding one is rejected rather than
+        // overwriting the older entry.
         if let Some(old) = self.in_flights.insert(request.sync, tx) {
             let new = self
                 .in_flights
@@ -92,13 +117,25 @@ impl ConnectionData {
         Ok(())
     }
 
+    /// Forget the request with `sync`: its caller timed out and dropped the
+    /// receiver. A response arriving later is logged as unknown and dropped.
+    #[inline]
+    fn cancel(&mut self, sync: u32) {
+        if self.in_flights.remove(&sync).is_some() {
+            trace!("Cancelled request with sync {}", sync);
+        }
+    }
+
     /// Send result of processing request (by sync) to client.
     #[inline]
     fn respond_to_client(&mut self, sync: u32, response: impl Into<DispatcherResponse>) {
         match self.in_flights.remove(&sync) {
             Some(tx) => {
                 if tx.send(response).is_err() {
-                    warn!("Failed to pass response sync {}, receiver dropped", sync);
+                    // Expected race: the caller timed out and dropped its
+                    // receiver, and this response was read before the
+                    // queued `Cancel(sync)` was processed.
+                    debug!("Failed to pass response sync {}, receiver dropped", sync);
                 }
             }
             _ => {
@@ -197,13 +234,10 @@ impl Connection {
         let mut read_stream = FramedRead::new(read_tcp_stream, ClientCodec::default());
         let mut write_stream = FramedWrite::new(write_tcp_stream, ClientCodec::default());
 
-        let mut conn_data = ConnectionData::default();
-
         if let Some(user) = user {
             Self::auth(
                 &mut read_stream,
                 &mut write_stream,
-                conn_data.next_sync(),
                 user,
                 password,
                 &greeting.salt,
@@ -213,8 +247,7 @@ impl Connection {
 
         // TODO: add option to disable pre 2.10 features (ID request, streams, watchers)
         // Runs on every connection, so a reconnect re-negotiates features.
-        let negotiated =
-            Self::id(&mut read_stream, &mut write_stream, conn_data.next_sync()).await?;
+        let negotiated = Self::id(&mut read_stream, &mut write_stream).await?;
         debug!("Negotiated features: {:?}", negotiated);
         *features.write() = negotiated;
 
@@ -235,7 +268,7 @@ impl Connection {
             writer_tx,
             writer_task_handle,
             writer_task_cancellation_token,
-            data: conn_data,
+            data: ConnectionData::default(),
         };
 
         Ok(this)
@@ -282,23 +315,22 @@ impl Connection {
     async fn auth(
         read_stream: &mut FramedRead<OwnedReadHalf, ClientCodec>,
         write_stream: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
-        sync: u32,
         user: &str,
         password: Option<&str>,
         salt: &[u8],
     ) -> Result<(), Error> {
         let mut request = EncodedRequest::new(&Auth::new(user, password, salt), None).unwrap();
-        *request.sync_mut() = sync;
+        *request.sync_mut() = HANDSHAKE_SYNC;
 
         trace!("Sending auth request");
         write_stream.send(request).await?;
 
         let resp = Self::get_next_stream_value(read_stream).await?;
-        if resp.sync != sync {
+        if resp.sync != HANDSHAKE_SYNC {
             return Err(Error::Other(anyhow::anyhow!(
                 "Unexpected sync {} in auth response, expected {}",
                 resp.sync,
-                sync
+                HANDSHAKE_SYNC
             )));
         }
         match resp.body {
@@ -312,20 +344,19 @@ impl Connection {
     async fn id(
         read_stream: &mut FramedRead<OwnedReadHalf, ClientCodec>,
         write_stream: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
-        sync: u32,
     ) -> Result<ConnectionFeatures, Error> {
         let mut request = EncodedRequest::new(&Id::default(), None)?;
-        *request.sync_mut() = sync;
+        *request.sync_mut() = HANDSHAKE_SYNC;
 
         trace!("Sending ID request");
         write_stream.send(request).await?;
 
         let resp = Self::get_next_stream_value(read_stream).await?;
-        if resp.sync != sync {
+        if resp.sync != HANDSHAKE_SYNC {
             return Err(Error::Other(anyhow::anyhow!(
                 "Unexpected sync {} in ID response, expected {}",
                 resp.sync,
-                sync
+                HANDSHAKE_SYNC
             )));
         }
         match resp.body {
@@ -360,7 +391,8 @@ impl Connection {
     /// `Err` means connection was dropped due to some error.
     pub(crate) async fn run(
         self,
-        client_rx: &mut ReceiverStream<DispatcherRequest>,
+        client_rx: &mut ReceiverStream<DispatcherMessage>,
+        current_generation: &AtomicU64,
     ) -> Result<(), ()> {
         let Self {
             mut read_stream,
@@ -385,21 +417,31 @@ impl Connection {
 
                 // Read value from internal queue if nothing being sent to writer
                 next = client_rx.next(), if send_to_writer_future.is_terminated() => {
-                    if let Some((mut request, tx)) = next {
-                        // If failed to prepare request or client already
-                        // dropped oneshot - just go to next
-                        if tx.is_closed() || data
-                            .try_prepare_request(&mut request, tx)
-                            .is_err()
-                        {
-                            continue;
-                        }
+                    match next {
+                        Some(DispatcherMessage::Request(ClientRequest { request, generation, responder })) => {
+                            // If failed to prepare request (stale generation,
+                            // duplicate sync) or client already dropped
+                            // oneshot - just go to next
+                            if responder.is_closed() || data
+                                .try_prepare_request(
+                                    &request,
+                                    generation,
+                                    current_generation.load(Ordering::Acquire),
+                                    responder,
+                                )
+                                .is_err()
+                            {
+                                continue;
+                            }
 
-                        send_to_writer_future.set(writer_tx.send(request).fuse());
-                    } else {
-                        // TODO: actually don't quit until all in-flights processed
-                        debug!("All senders dropped");
-                        break Ok(());
+                            send_to_writer_future.set(writer_tx.send(request).fuse());
+                        }
+                        Some(DispatcherMessage::Cancel(sync)) => data.cancel(sync),
+                        None => {
+                            // TODO: actually don't quit until all in-flights processed
+                            debug!("All senders dropped");
+                            break Ok(());
+                        }
                     }
                 }
 
@@ -448,9 +490,11 @@ pub(super) mod tests {
     use tracing_test::traced_test;
 
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     use parking_lot::RwLock;
     use rmpv::Value;
+    use tokio::sync::oneshot;
 
     use crate::codec::consts::RequestType;
     use crate::codec::request::ConnectionFeatures;
@@ -557,16 +601,6 @@ pub(super) mod tests {
         addr
     }
 
-    #[test]
-    fn next_sync_wraps_around() {
-        let mut data = ConnectionData {
-            next_sync: u32::MAX,
-            ..ConnectionData::default()
-        };
-        assert_eq!(data.next_sync(), u32::MAX);
-        assert_eq!(data.next_sync(), 0);
-    }
-
     #[tokio::test]
     async fn small_threshold_does_not_panic() {
         let addr = spawn_fake_server(echo_sync).await;
@@ -599,19 +633,19 @@ pub(super) mod tests {
     async fn writer_task_panic_is_reported_as_error() {
         let (conn, _server) =
             connection_with_writer(async { panic!("writer task panicked") }).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherRequest>(1);
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(1);
         let mut client_rx = ReceiverStream::new(client_rx);
         drop(client_tx);
-        assert!(conn.run(&mut client_rx).await.is_err());
+        assert!(conn.run(&mut client_rx, &AtomicU64::new(0)).await.is_err());
     }
 
     #[tokio::test]
     async fn writer_task_clean_exit_is_reported_as_ok() {
         let (conn, _server) = connection_with_writer(async { Ok(()) }).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherRequest>(1);
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(1);
         let mut client_rx = ReceiverStream::new(client_rx);
         drop(client_tx);
-        assert!(conn.run(&mut client_rx).await.is_ok());
+        assert!(conn.run(&mut client_rx, &AtomicU64::new(0)).await.is_ok());
     }
 
     #[tokio::test]
@@ -684,15 +718,18 @@ pub(super) mod tests {
         // to the writer fails and the connection tears down while the request
         // is registered in `in_flights`.
         let (conn, _server) = connection_with_writer(async { Ok(()) }).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherRequest>(1);
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(1);
         let mut client_rx = ReceiverStream::new(client_rx);
         let sender = DispatcherSender::new_for_test(client_tx, Arc::default());
+        // `join!` borrows across its whole body, so the generation needs a
+        // binding rather than a temporary.
+        let generation = AtomicU64::new(0);
 
         // `join!` keeps both futures inside the test's tracing span, which
         // `logs_contain` needs; a spawned task would log outside it.
         let (run_res, send_res) = tokio::join!(
-            conn.run(&mut client_rx),
-            sender.send(EncodedRequest::new(&Ping {}, None).unwrap()),
+            conn.run(&mut client_rx, &generation),
+            sender.send(EncodedRequest::new(&Ping {}, None).unwrap(), None),
         );
 
         assert!(run_res.is_err());
@@ -701,5 +738,203 @@ pub(super) mod tests {
             "{send_res:?}"
         );
         assert!(!logs_contain("Unknown sync"));
+    }
+
+    fn ping_with_sync(sync: u32) -> EncodedRequest {
+        let mut request = EncodedRequest::new(&Ping {}, None).unwrap();
+        *request.sync_mut() = sync;
+        request
+    }
+
+    /// A ping issued through a stream (stream id 1).
+    fn stream_ping_with_sync(sync: u32) -> EncodedRequest {
+        let mut request = EncodedRequest::new(&Ping {}, Some(1)).unwrap();
+        *request.sync_mut() = sync;
+        request
+    }
+
+    fn client_request(
+        request: EncodedRequest,
+        generation: Option<u64>,
+        tx: oneshot::Sender<DispatcherResponse>,
+    ) -> DispatcherMessage {
+        DispatcherMessage::Request(ClientRequest {
+            request,
+            generation,
+            responder: DispatcherResponseSender(tx),
+        })
+    }
+
+    /// Connection over a local socket pair with the real writer task and no
+    /// handshake; the returned stream is the server side of the socket.
+    async fn connected_pair() -> (Connection, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (read, write) = client.into_split();
+        let (writer_tx, writer_rx) = mpsc::channel(8);
+        let token = CancellationToken::new();
+        let conn = Connection {
+            read_stream: FramedRead::new(read, ClientCodec::default()),
+            writer_tx,
+            writer_task_handle: tokio::spawn(writer_task(
+                writer_rx,
+                FramedWrite::new(write, ClientCodec::default()),
+                token.clone(),
+            )),
+            writer_task_cancellation_token: token,
+            data: ConnectionData::default(),
+        };
+        (conn, server)
+    }
+
+    #[test]
+    fn cancel_removes_in_flight_entry() {
+        let mut data = ConnectionData::default();
+        let (tx, mut rx) = oneshot::channel();
+        assert!(
+            data.try_prepare_request(&ping_with_sync(7), None, 0, DispatcherResponseSender(tx))
+                .is_ok()
+        );
+
+        data.cancel(7);
+
+        assert!(data.in_flights.is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn stale_generation_is_answered_without_registering() {
+        let mut data = ConnectionData::default();
+
+        // Issued through a stream at generation 0; the connection is at 1.
+        let (tx, mut rx) = oneshot::channel();
+        assert!(
+            data.try_prepare_request(
+                &stream_ping_with_sync(8),
+                Some(0),
+                1,
+                DispatcherResponseSender(tx)
+            )
+            .is_err()
+        );
+        assert!(data.in_flights.is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DispatcherResponse::Finished(Err(Error::ConnectionReset)))
+        ));
+
+        // Control: the same request without a generation is registered.
+        let (tx, _rx) = oneshot::channel();
+        assert!(
+            data.try_prepare_request(
+                &stream_ping_with_sync(8),
+                None,
+                1,
+                DispatcherResponseSender(tx)
+            )
+            .is_ok()
+        );
+        assert!(data.in_flights.contains_key(&8));
+    }
+
+    #[tokio::test]
+    async fn stale_stream_request_queued_across_reconnect_is_rejected() {
+        let (conn, mut server) = connected_pair().await;
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(4);
+        let mut client_rx = ReceiverStream::new(client_rx);
+        // The dispatcher already reconnected: this connection is generation 1.
+        let generation = AtomicU64::new(1);
+        let (stale_tx, stale_rx) = oneshot::channel();
+        let (plain_tx, plain_rx) = oneshot::channel();
+
+        let script = async move {
+            // Both requests were queued before the reconnect finished: one
+            // issued through a stream at generation 0, the same one without a
+            // generation as the control.
+            client_tx
+                .send(client_request(stream_ping_with_sync(10), Some(0), stale_tx))
+                .await
+                .unwrap();
+            client_tx
+                .send(client_request(stream_ping_with_sync(11), None, plain_tx))
+                .await
+                .unwrap();
+
+            // Only the control reaches the server.
+            assert_eq!(read_request(&mut server).await.unwrap().1, 11);
+            server
+                .write_all(&ok_response(11, &Value::Map(Vec::new())))
+                .await
+                .unwrap();
+            let plain = plain_rx.await;
+
+            drop(client_tx);
+            (server, stale_rx.await, plain)
+        };
+        let (run_res, (_server, stale, plain)) =
+            tokio::join!(conn.run(&mut client_rx, &generation), script);
+
+        assert!(run_res.is_ok());
+        assert!(matches!(
+            stale,
+            Ok(DispatcherResponse::Finished(Err(Error::ConnectionReset)))
+        ));
+        assert!(matches!(plain, Ok(DispatcherResponse::Finished(Ok(_)))));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn late_response_for_cancelled_sync_is_ignored() {
+        let (conn, mut server) = connected_pair().await;
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(4);
+        let mut client_rx = ReceiverStream::new(client_rx);
+        let generation = AtomicU64::new(0);
+        let (tx5, rx5) = oneshot::channel();
+
+        let script = async move {
+            client_tx
+                .send(client_request(ping_with_sync(5), None, tx5))
+                .await
+                .unwrap();
+            assert_eq!(read_request(&mut server).await.unwrap().1, 5);
+
+            // The caller times out: it drops its receiver and cancels.
+            drop(rx5);
+            client_tx.send(DispatcherMessage::Cancel(5)).await.unwrap();
+
+            // Request 6 reaching the server proves Cancel(5), queued before
+            // it, was processed.
+            let (tx6, rx6) = oneshot::channel();
+            client_tx
+                .send(client_request(ping_with_sync(6), None, tx6))
+                .await
+                .unwrap();
+            assert_eq!(read_request(&mut server).await.unwrap().1, 6);
+
+            // The late response for 5 is read before the one for 6.
+            server
+                .write_all(&ok_response(5, &Value::Map(Vec::new())))
+                .await
+                .unwrap();
+            server
+                .write_all(&ok_response(6, &Value::Map(Vec::new())))
+                .await
+                .unwrap();
+            assert!(matches!(rx6.await, Ok(DispatcherResponse::Finished(Ok(_)))));
+
+            drop(client_tx);
+            server
+        };
+        let (run_res, _server) = tokio::join!(conn.run(&mut client_rx, &generation), script);
+
+        assert!(run_res.is_ok());
+        assert!(logs_contain("Unknown sync 5"));
+        assert!(!logs_contain("receiver dropped"));
     }
 }
