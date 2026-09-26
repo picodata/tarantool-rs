@@ -14,9 +14,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo check --all-targets
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -Dclippy::all -Wclippy::pedantic --deny warnings --no-deps
+      - run: cargo clippy --all-targets -- -Dclippy::all -Wclippy::pedantic --deny warnings
 
   test:
     name: Test Suite
@@ -40,6 +39,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit,cargo-deny
+          tool: cargo-audit
       - run: cargo audit
-      - run: cargo deny check advisories
