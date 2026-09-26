@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll, ready},
     time::Duration,
 };
 
@@ -13,7 +14,6 @@ use tokio::{
     net::ToSocketAddrs,
     sync::{mpsc, oneshot},
 };
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error};
 
 use super::connection::Connection;
@@ -31,14 +31,6 @@ pub(crate) struct ClientRequest {
     /// `Error::ConnectionReset` instead of sending it.
     pub(crate) generation: Option<u64>,
     pub(crate) responder: DispatcherResponseSender,
-}
-
-/// Message from the client side to the dispatcher.
-pub(crate) enum DispatcherMessage {
-    /// Send the request and route its response back.
-    Request(ClientRequest),
-    /// The caller gave up on the request with this sync; forget it.
-    Cancel(u64),
 }
 
 /// Channel the response to one request, or its error, goes to.
@@ -60,8 +52,90 @@ impl DispatcherResponseSender {
     }
 }
 
+/// Cloneable handle that sends requests to the dispatcher.
+///
+/// It holds the request queue and the cancel channel, never the liveness
+/// receiver, so a clone kept by a background task cannot keep the dispatcher
+/// alive once the last client handle is gone.
+#[derive(Clone)]
+pub(crate) struct RequestSender {
+    requests: mpsc::Sender<ClientRequest>,
+    cancels: mpsc::UnboundedSender<u64>,
+}
+
+impl RequestSender {
+    /// Queue `request` and wait for its response.
+    ///
+    /// Dropping the returned future after the request was queued and before
+    /// its response arrived sends the request's sync on the cancel channel,
+    /// so the transport forgets it: a timeout, a lost `select!` branch and an
+    /// aborted task all cancel. A request that never entered the queue sends
+    /// nothing.
+    pub(crate) async fn send(
+        &self,
+        request: EncodedRequest,
+        generation: Option<u64>,
+    ) -> Result<Response, Error> {
+        let sync = request.sync;
+        let (tx, rx) = oneshot::channel();
+        // A failed send means the dispatcher task is gone, which is permanent.
+        if self
+            .requests
+            .send(ClientRequest {
+                request,
+                generation,
+                responder: DispatcherResponseSender(tx),
+            })
+            .await
+            .is_err()
+        {
+            return Err(Error::ConnectionClosed);
+        }
+        PendingResponse {
+            rx,
+            sync,
+            cancels: &self.cancels,
+            answered: false,
+        }
+        .await
+    }
+}
+
+/// Response to a queued request. Dropped before the response arrived, it
+/// sends the request's sync on the cancel channel.
+struct PendingResponse<'a> {
+    rx: oneshot::Receiver<Result<Response, Error>>,
+    sync: u64,
+    cancels: &'a mpsc::UnboundedSender<u64>,
+    answered: bool,
+}
+
+impl Future for PendingResponse<'_> {
+    type Output = Result<Response, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let response = ready!(Pin::new(&mut self.rx).poll(cx));
+        self.answered = true;
+        Poll::Ready(response.unwrap_or(Err(Error::ConnectionClosed)))
+    }
+}
+
+impl Drop for PendingResponse<'_> {
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+        // Closed first: if `run` reads the request only after the cancel, it
+        // finds the responder closed and skips the request.
+        self.rx.close();
+        // Fails only once the dispatcher is gone, and then nothing is left to
+        // cancel.
+        let _ = self.cancels.send(self.sync);
+    }
+}
+
 pub(crate) struct DispatcherSender {
-    tx: mpsc::Sender<DispatcherMessage>,
+    requests: RequestSender,
     generation: Arc<AtomicU64>,
     /// Dropped together with the last client handle; the dispatcher awaits
     /// that through [`Dispatcher::client_liveness`].
@@ -71,12 +145,13 @@ pub(crate) struct DispatcherSender {
 impl DispatcherSender {
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        tx: mpsc::Sender<DispatcherMessage>,
+        requests: mpsc::Sender<ClientRequest>,
+        cancels: mpsc::UnboundedSender<u64>,
         generation: Arc<AtomicU64>,
     ) -> Self {
         let (_client_liveness, liveness) = oneshot::channel();
         Self {
-            tx,
+            requests: RequestSender { requests, cancels },
             generation,
             _liveness: liveness,
         }
@@ -87,37 +162,9 @@ impl DispatcherSender {
         self.generation.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn send(
-        &self,
-        request: EncodedRequest,
-        generation: Option<u64>,
-    ) -> Result<Response, Error> {
-        let (tx, rx) = oneshot::channel();
-        // A failed send means the dispatcher task is gone, which is permanent.
-        if self
-            .tx
-            .send(DispatcherMessage::Request(ClientRequest {
-                request,
-                generation,
-                responder: DispatcherResponseSender(tx),
-            }))
-            .await
-            .is_err()
-        {
-            return Err(Error::ConnectionClosed);
-        }
-        rx.await.unwrap_or(Err(Error::ConnectionClosed))
-    }
-
-    /// Tell the dispatcher that nobody awaits the response for `sync` any more.
-    ///
-    /// Best-effort: if the channel is full or closed the message is dropped,
-    /// and the entry lives until its response arrives or the connection is
-    /// recycled.
-    pub(crate) fn cancel(&self, sync: u64) {
-        if let Err(err) = self.tx.try_send(DispatcherMessage::Cancel(sync)) {
-            debug!("Failed to cancel sync {sync}: {err}");
-        }
+    /// The request handle, which does not carry the liveness receiver.
+    pub(crate) fn requests(&self) -> &RequestSender {
+        &self.requests
     }
 }
 
@@ -138,7 +185,10 @@ enum ReconnectOutcome {
 /// successful reconnect, and exits once the last client handle is dropped.
 /// Schema reloading and pooling are not implemented yet.
 pub(crate) struct Dispatcher {
-    rx: ReceiverStream<DispatcherMessage>,
+    rx: mpsc::Receiver<ClientRequest>,
+    /// Syncs of the requests whose callers gave up. Unbounded, so a cancel is
+    /// never lost to a full request queue.
+    cancel_rx: mpsc::UnboundedReceiver<u64>,
     conn: Option<Connection>,
     conn_factory: ConnFactory,
     reconnect_interval: Option<ReconnectInterval>,
@@ -201,11 +251,13 @@ impl Dispatcher {
         queue_size: usize,
     ) -> (Self, DispatcherSender) {
         let (tx, rx) = mpsc::channel(queue_size);
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
         let generation = Arc::new(AtomicU64::new(0));
         let (client_liveness, liveness) = oneshot::channel();
         (
             Self {
-                rx: ReceiverStream::new(rx),
+                rx,
+                cancel_rx,
                 conn,
                 conn_factory,
                 reconnect_interval,
@@ -213,7 +265,10 @@ impl Dispatcher {
                 client_liveness,
             },
             DispatcherSender {
-                tx,
+                requests: RequestSender {
+                    requests: tx,
+                    cancels: cancel_tx,
+                },
                 generation,
                 _liveness: liveness,
             },
@@ -257,7 +312,11 @@ impl Dispatcher {
         loop {
             match self.conn.take() {
                 Some(conn) => {
-                    if conn.run(&mut self.rx, &self.generation).await.is_ok() {
+                    if conn
+                        .run(&mut self.rx, &mut self.cancel_rx, &self.generation)
+                        .await
+                        .is_ok()
+                    {
                         return;
                     }
                 }

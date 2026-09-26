@@ -151,24 +151,22 @@ impl Connection {
     /// whose generation is no longer current with [`Error::ConnectionReset`]
     /// instead of sending it, which also covers requests that were already
     /// waiting in the dispatcher queue when a reconnect happened.
+    ///
+    /// Dropping the returned future once the request is queued, for example
+    /// on the request timeout, cancels the request in the transport.
     pub(crate) async fn send_with_generation(
         &self,
         mut request: EncodedRequest,
         generation: Option<u64>,
     ) -> Result<Value> {
-        let sync = self.next_sync();
-        *request.sync_mut() = sync;
-        let fut = self.inner.dispatcher_sender.send(request, generation);
+        *request.sync_mut() = self.next_sync();
+        let fut = self
+            .inner
+            .dispatcher_sender
+            .requests()
+            .send(request, generation);
         let resp = match self.inner.timeout {
-            Some(x) => match timeout(x, fut).await {
-                Ok(resp) => resp?,
-                Err(elapsed) => {
-                    // Nobody will read the response any more; let the
-                    // transport forget the in-flight entry.
-                    self.inner.dispatcher_sender.cancel(sync);
-                    return Err(elapsed.into());
-                }
-            },
+            Some(x) => timeout(x, fut).await??,
             None => fut.await?,
         };
         match resp.body {
@@ -307,24 +305,34 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::consts::RequestType,
-        codec::response::Response,
-        errors::ErrorResponse,
-        transport::{ClientRequest, DispatcherMessage},
+        codec::consts::RequestType, codec::response::Response, errors::ErrorResponse,
+        transport::ClientRequest,
     };
 
     fn test_connection(
-        tx: mpsc::Sender<DispatcherMessage>,
+        tx: mpsc::Sender<ClientRequest>,
         generation: Arc<AtomicU64>,
         request_timeout: Option<Duration>,
     ) -> Connection {
-        Connection::new(
-            DispatcherSender::new_for_test(tx, generation),
+        test_connection_with_cancels(tx, generation, request_timeout).0
+    }
+
+    /// [`test_connection`] that also returns the receiver of the cancels its
+    /// requests send when they are dropped.
+    fn test_connection_with_cancels(
+        tx: mpsc::Sender<ClientRequest>,
+        generation: Arc<AtomicU64>,
+        request_timeout: Option<Duration>,
+    ) -> (Connection, mpsc::UnboundedReceiver<u64>) {
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+        let conn = Connection::new(
+            DispatcherSender::new_for_test(tx, cancel_tx, generation),
             request_timeout,
             None,
             TransactionIsolationLevel::default(),
             10,
-        )
+        );
+        (conn, cancel_rx)
     }
 
     fn ok_body(_request_type: u8) -> ResponseBody {
@@ -353,26 +361,33 @@ mod tests {
         }
     }
 
+    /// `(request_type, stream_id, sync, generation)` of one request the fake
+    /// dispatcher received.
+    type Seen = (u8, Option<u32>, u64, Option<u64>);
+
     /// Fake dispatcher: answers every request with `reply(request_type)` and
-    /// records the `(request_type, stream_id)` of every request it receives.
-    /// Cancel messages are ignored.
-    #[allow(clippy::type_complexity)]
+    /// records every request it receives. `reply` may keep state, so one test
+    /// can answer the same request type differently over time.
     fn spawn_fake_dispatcher(
-        mut rx: mpsc::Receiver<DispatcherMessage>,
-        reply: fn(u8) -> ResponseBody,
-    ) -> Arc<Mutex<Vec<(u8, Option<u32>)>>> {
+        mut rx: mpsc::Receiver<ClientRequest>,
+        mut reply: impl FnMut(u8) -> ResponseBody + Send + 'static,
+    ) -> Arc<Mutex<Vec<Seen>>> {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_by_task = seen.clone();
         tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                let DispatcherMessage::Request(ClientRequest {
-                    request, responder, ..
-                }) = message
-                else {
-                    continue;
-                };
+            while let Some(ClientRequest {
+                request,
+                generation,
+                responder,
+            }) = rx.recv().await
+            {
                 let request_type = request.request_type as u8;
-                seen_by_task.lock().push((request_type, request.stream_id));
+                seen_by_task.lock().push((
+                    request_type,
+                    request.stream_id,
+                    request.sync,
+                    generation,
+                ));
                 let _ = responder.send(Ok(Response {
                     sync: request.sync,
                     schema_version: 1,
@@ -381,6 +396,14 @@ mod tests {
             }
         });
         seen
+    }
+
+    /// `(request_type, stream_id)` of every request the fake dispatcher saw.
+    fn kinds(seen: &Mutex<Vec<Seen>>) -> Vec<(u8, Option<u32>)> {
+        seen.lock()
+            .iter()
+            .map(|&(request_type, stream_id, ..)| (request_type, stream_id))
+            .collect()
     }
 
     #[tokio::test]
@@ -396,7 +419,7 @@ mod tests {
         // Give a drop-time rollback, if any, the chance to reach the dispatcher.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            *seen.lock(),
+            kinds(&seen),
             vec![
                 (RequestType::Begin as u8, Some(1)),
                 (RequestType::Commit as u8, Some(1)),
@@ -416,7 +439,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            *seen.lock(),
+            kinds(&seen),
             vec![
                 (RequestType::Begin as u8, Some(1)),
                 (RequestType::Rollback as u8, Some(1)),
@@ -426,33 +449,14 @@ mod tests {
 
     #[tokio::test]
     async fn requests_carry_client_assigned_syncs() {
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, rx) = mpsc::channel(8);
         let conn = test_connection(tx, Arc::default(), None);
+        let seen = spawn_fake_dispatcher(rx, ok_body);
 
-        let dispatcher = async {
-            let mut syncs = Vec::new();
-            for _ in 0..2 {
-                let Some(DispatcherMessage::Request(ClientRequest {
-                    request, responder, ..
-                })) = rx.recv().await
-                else {
-                    panic!("expected a request");
-                };
-                syncs.push(request.sync);
-                let _ = responder.send(Ok(Response {
-                    sync: request.sync,
-                    schema_version: 1,
-                    body: ok_body(0),
-                }));
-            }
-            syncs
-        };
-        let pings = async {
-            conn.ping().await.unwrap();
-            conn.ping().await.unwrap();
-        };
-        let ((), syncs) = tokio::join!(pings, dispatcher);
+        conn.ping().await.unwrap();
+        conn.ping().await.unwrap();
 
+        let syncs: Vec<u64> = seen.lock().iter().map(|&(_, _, sync, _)| sync).collect();
         assert_eq!(syncs, vec![1, 2]);
     }
 
@@ -471,84 +475,75 @@ mod tests {
     #[tokio::test]
     async fn timed_out_request_cancels_its_sync() {
         let (tx, mut rx) = mpsc::channel(8);
-        let conn = test_connection(tx, Arc::default(), Some(Duration::from_millis(50)));
+        let (conn, mut cancels) =
+            test_connection_with_cancels(tx, Arc::default(), Some(Duration::from_millis(50)));
 
         let dispatcher = async {
-            let Some(DispatcherMessage::Request(ClientRequest {
-                request, responder, ..
-            })) = rx.recv().await
-            else {
-                panic!("expected the request first");
-            };
-            // Hold the responder so the request never completes.
-            let message = timeout(Duration::from_secs(1), rx.recv())
+            // Hold the request, and with it its responder, so it never
+            // completes.
+            let request = rx.recv().await.expect("expected the request first");
+            let cancelled = timeout(Duration::from_secs(1), cancels.recv())
                 .await
                 .expect("no cancel after the timeout");
-            let Some(DispatcherMessage::Cancel(cancelled)) = message else {
-                panic!("expected a cancel after the timeout");
-            };
-            drop(responder);
-            (request.sync, cancelled)
+            (request.request.sync, cancelled)
         };
         let (res, (sent, cancelled)) = tokio::join!(conn.ping(), dispatcher);
 
         assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
-        assert_eq!(sent, cancelled);
+        assert_eq!(cancelled, Some(sent));
     }
 
     #[tokio::test]
-    async fn timeout_with_full_dispatcher_queue_drops_the_cancel() {
+    async fn dropped_request_future_cancels_its_sync() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (conn, mut cancels) = test_connection_with_cancels(tx, Arc::default(), None);
+
+        let mut ping = conn.ping();
+        assert!(futures::poll!(ping.as_mut()).is_pending());
+        let request = rx.try_recv().expect("the request was queued");
+        drop(ping);
+
+        assert_eq!(cancels.try_recv(), Ok(request.request.sync));
+    }
+
+    #[tokio::test]
+    async fn future_dropped_while_waiting_for_queue_capacity_sends_no_cancel() {
         let (tx, mut rx) = mpsc::channel(1);
-        let conn = test_connection(tx.clone(), Arc::default(), Some(Duration::from_millis(50)));
-        // Fill the queue so neither the request nor its cancel fits.
-        assert!(tx.try_send(DispatcherMessage::Cancel(u64::MAX)).is_ok());
+        let (conn, mut cancels) = test_connection_with_cancels(tx, Arc::default(), None);
 
-        let res = timeout(Duration::from_secs(1), conn.ping())
-            .await
-            .expect("a timed-out request blocked on its cancel");
+        // The first request takes the only slot of the queue.
+        let mut first = conn.ping();
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let mut second = conn.ping();
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        drop(second);
 
-        assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(DispatcherMessage::Cancel(u64::MAX))
-        ));
-        assert!(rx.try_recv().is_err(), "a message was queued past capacity");
+        assert!(
+            cancels.try_recv().is_err(),
+            "a request that never entered the queue was cancelled"
+        );
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "the second request was queued");
+        drop(first);
     }
 
     #[tokio::test]
     async fn stream_requests_carry_their_generation() {
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, rx) = mpsc::channel(8);
         let conn = test_connection(tx, Arc::new(AtomicU64::new(3)), None);
+        let seen = spawn_fake_dispatcher(rx, ok_body);
 
-        let dispatcher = async {
-            let mut seen = Vec::new();
-            for _ in 0..2 {
-                let Some(DispatcherMessage::Request(ClientRequest {
-                    request,
-                    generation,
-                    responder,
-                })) = rx.recv().await
-                else {
-                    panic!("expected a request");
-                };
-                seen.push((request.stream_id.is_some(), generation));
-                let _ = responder.send(Ok(Response {
-                    sync: request.sync,
-                    schema_version: 1,
-                    body: ok_body(0),
-                }));
-            }
-            seen
-        };
-        let requests = async {
-            conn.stream().ping().await.unwrap();
-            conn.ping().await.unwrap();
-        };
-        let ((), seen) = tokio::join!(requests, dispatcher);
+        conn.stream().ping().await.unwrap();
+        conn.ping().await.unwrap();
 
         // The stream request carries the generation it was issued under; the
         // plain request carries none and is never rejected for staleness.
-        assert_eq!(seen, vec![(true, Some(3)), (false, None)]);
+        let generations: Vec<(bool, Option<u64>)> = seen
+            .lock()
+            .iter()
+            .map(|&(_, stream_id, _, generation)| (stream_id.is_some(), generation))
+            .collect();
+        assert_eq!(generations, vec![(true, Some(3)), (false, None)]);
     }
 
     #[tokio::test]
@@ -601,7 +596,7 @@ mod tests {
         drop(transaction);
         // Give a drop-time rollback, if any, the chance to reach the dispatcher.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(*seen.lock(), vec![(RequestType::Begin as u8, Some(1))]);
+        assert_eq!(kinds(&seen), vec![(RequestType::Begin as u8, Some(1))]);
     }
 
     #[tokio::test]
@@ -614,7 +609,7 @@ mod tests {
         generation.fetch_add(1, Ordering::SeqCst);
 
         conn.ping().await.unwrap();
-        assert_eq!(*seen.lock(), vec![(RequestType::Ping as u8, None)]);
+        assert_eq!(kinds(&seen), vec![(RequestType::Ping as u8, None)]);
     }
 
     #[tokio::test]
@@ -626,7 +621,7 @@ mod tests {
         let prepares = || {
             seen.lock()
                 .iter()
-                .filter(|(request_type, _)| *request_type == RequestType::Prepare as u8)
+                .filter(|(request_type, ..)| *request_type == RequestType::Prepare as u8)
                 .count()
         };
 

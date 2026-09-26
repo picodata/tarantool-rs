@@ -2442,7 +2442,6 @@ dependencies = [
  "tarantool-test-container",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tracing",
  "tracing-test",

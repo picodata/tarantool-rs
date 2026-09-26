@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures::{
-    FutureExt, SinkExt, StreamExt, TryStreamExt,
+    FutureExt, SinkExt, TryStreamExt,
     future::{Fuse, FusedFuture},
 };
 
@@ -20,11 +20,10 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, error, trace, warn};
 
-use super::dispatcher::{ClientRequest, DispatcherMessage, DispatcherResponseSender};
+use super::dispatcher::{ClientRequest, DispatcherResponseSender};
 use crate::{
     codec::{
         ClientCodec, Greeting,
@@ -120,8 +119,9 @@ impl ConnectionData {
         Ok(())
     }
 
-    /// Forget the request with `sync`: its caller timed out and dropped the
-    /// receiver. A response arriving later is logged as unknown and dropped.
+    /// Forget the request with `sync`: its caller dropped the receiver (a
+    /// timeout, a dropped future, a lost `select!` branch). A response
+    /// arriving later is logged as unknown and dropped.
     #[inline]
     fn cancel(&mut self, sync: u64) {
         if self.in_flights.remove(&sync).is_some() {
@@ -135,9 +135,8 @@ impl ConnectionData {
         match self.in_flights.remove(&sync) {
             Some(tx) => {
                 if tx.send(response).is_err() {
-                    // Expected race: the caller timed out and dropped its
-                    // receiver, and this response was read before the
-                    // queued `Cancel(sync)` was processed.
+                    // Expected race: the caller dropped its receiver, and this
+                    // response was read before its cancel.
                     debug!("Failed to pass response sync {}, receiver dropped", sync);
                 }
             }
@@ -376,7 +375,8 @@ impl Connection {
     /// `Err` means connection was dropped due to some error.
     pub(crate) async fn run(
         self,
-        client_rx: &mut ReceiverStream<DispatcherMessage>,
+        client_rx: &mut mpsc::Receiver<ClientRequest>,
+        cancel_rx: &mut mpsc::UnboundedReceiver<u64>,
         current_generation: &AtomicU64,
     ) -> Result<(), ()> {
         let Self {
@@ -399,34 +399,32 @@ impl Connection {
                     }
                 }
 
-                // Read value from internal queue if nothing being sent to writer
-                next = client_rx.next(), if send_to_writer_future.is_terminated() => {
-                    match next {
-                        Some(DispatcherMessage::Request(ClientRequest { request, generation, responder })) => {
-                            // If failed to prepare request (stale generation,
-                            // duplicate sync) or client already dropped
-                            // oneshot - just go to next
-                            if responder.is_closed() || data
-                                .try_prepare_request(
-                                    &request,
-                                    generation,
-                                    current_generation.load(Ordering::Acquire),
-                                    responder,
-                                )
-                                .is_err()
-                            {
-                                continue;
-                            }
+                // Never gated: a cancel must get through while a hand-off to
+                // the writer is pending, and it only removes an entry.
+                Some(sync) = cancel_rx.recv() => data.cancel(sync),
 
-                            send_to_writer_future.set(writer_tx.send(request).fuse());
-                        }
-                        Some(DispatcherMessage::Cancel(sync)) => data.cancel(sync),
-                        None => {
-                            // TODO: actually don't quit until all in-flights processed
-                            debug!("All senders dropped");
-                            break Ok(());
-                        }
+                // Read value from internal queue if nothing being sent to writer
+                next = client_rx.recv(), if send_to_writer_future.is_terminated() => {
+                    let Some(ClientRequest { request, generation, responder }) = next else {
+                        debug!("All senders dropped");
+                        break Ok(());
+                    };
+                    // If failed to prepare request (stale generation,
+                    // duplicate sync) or client already dropped
+                    // oneshot - just go to next
+                    if responder.is_closed() || data
+                        .try_prepare_request(
+                            &request,
+                            generation,
+                            current_generation.load(Ordering::Acquire),
+                            responder,
+                        )
+                        .is_err()
+                    {
+                        continue;
                     }
+
+                    send_to_writer_future.set(writer_tx.send(request).fuse());
                 }
 
                 // Await sending request to writer.
@@ -765,20 +763,28 @@ pub(super) mod tests {
         let (conn, _server) =
             connection_pair(|_, _| async { panic!("writer task panicked") }).await;
         writer_ended(&conn).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(1);
-        let mut client_rx = ReceiverStream::new(client_rx);
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         drop(client_tx);
-        assert!(conn.run(&mut client_rx, &AtomicU64::new(0)).await.is_err());
+        assert!(
+            conn.run(&mut client_rx, &mut cancel_rx, &AtomicU64::new(0))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn writer_task_clean_exit_is_reported_as_ok() {
         let (conn, _server) = connection_pair(|_, _| async { Ok(()) }).await;
         writer_ended(&conn).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(1);
-        let mut client_rx = ReceiverStream::new(client_rx);
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         drop(client_tx);
-        assert!(conn.run(&mut client_rx, &AtomicU64::new(0)).await.is_ok());
+        assert!(
+            conn.run(&mut client_rx, &mut cancel_rx, &AtomicU64::new(0))
+                .await
+                .is_ok()
+        );
     }
 
     /// In-memory write half that counts write and flush calls and keeps the
@@ -880,8 +886,8 @@ pub(super) mod tests {
         // The peer never reads, so 32 requests of 1 MiB fill the socket
         // buffers and block the writer inside a write.
         let (conn, mut server) = connection_pair(real_writer).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(64);
-        let mut client_rx = ReceiverStream::new(client_rx);
+        let (client_tx, mut client_rx) = mpsc::channel(64);
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let generation = AtomicU64::new(0);
         let expr = "x".repeat(1024 * 1024);
         let mut receivers = Vec::new();
@@ -904,7 +910,10 @@ pub(super) mod tests {
             tokio::time::Instant::now()
         };
         let (run_res, shut_down_at) = timeout(Duration::from_secs(5), async {
-            tokio::join!(conn.run(&mut client_rx, &generation), script)
+            tokio::join!(
+                conn.run(&mut client_rx, &mut cancel_rx, &generation),
+                script
+            )
         })
         .await
         .expect("run waited for the blocked writer");
@@ -967,9 +976,9 @@ pub(super) mod tests {
         // to the writer fails and the connection tears down while the request
         // is registered in `in_flights`.
         let (conn, _server) = connection_pair(|_, _| async { Ok(()) }).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(1);
-        let mut client_rx = ReceiverStream::new(client_rx);
-        let sender = DispatcherSender::new_for_test(client_tx, Arc::default());
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let sender = DispatcherSender::new_for_test(client_tx, cancel_tx, Arc::default());
         // `join!` borrows across its whole body, so the generation needs a
         // binding rather than a temporary.
         let generation = AtomicU64::new(0);
@@ -977,8 +986,10 @@ pub(super) mod tests {
         // `join!` keeps both futures inside the test's tracing span, which
         // `logs_contain` needs; a spawned task would log outside it.
         let (run_res, send_res) = tokio::join!(
-            conn.run(&mut client_rx, &generation),
-            sender.send(EncodedRequest::new(&Ping {}, None).unwrap(), None),
+            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            sender
+                .requests()
+                .send(EncodedRequest::new(&Ping {}, None).unwrap(), None),
         );
 
         assert!(run_res.is_err());
@@ -1006,12 +1017,12 @@ pub(super) mod tests {
         request: EncodedRequest,
         generation: Option<u64>,
         tx: oneshot::Sender<Result<Response, Error>>,
-    ) -> DispatcherMessage {
-        DispatcherMessage::Request(ClientRequest {
+    ) -> ClientRequest {
+        ClientRequest {
             request,
             generation,
             responder: DispatcherResponseSender(tx),
-        })
+        }
     }
 
     #[test]
@@ -1067,8 +1078,8 @@ pub(super) mod tests {
     #[tokio::test]
     async fn stale_stream_request_queued_across_reconnect_is_rejected() {
         let (conn, mut server) = connection_pair(real_writer).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(4);
-        let mut client_rx = ReceiverStream::new(client_rx);
+        let (client_tx, mut client_rx) = mpsc::channel(4);
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         // The dispatcher already reconnected: this connection is generation 1.
         let generation = AtomicU64::new(1);
         let (stale_tx, stale_rx) = oneshot::channel();
@@ -1098,8 +1109,10 @@ pub(super) mod tests {
             drop(client_tx);
             (server, stale_rx.await, plain)
         };
-        let (run_res, (_server, stale, plain)) =
-            tokio::join!(conn.run(&mut client_rx, &generation), script);
+        let (run_res, (_server, stale, plain)) = tokio::join!(
+            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            script
+        );
 
         assert!(run_res.is_ok());
         assert!(matches!(stale, Ok(Err(Error::ConnectionReset))));
@@ -1110,8 +1123,8 @@ pub(super) mod tests {
     #[traced_test]
     async fn late_response_for_cancelled_sync_is_ignored() {
         let (conn, mut server) = connection_pair(real_writer).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(4);
-        let mut client_rx = ReceiverStream::new(client_rx);
+        let (client_tx, mut client_rx) = mpsc::channel(4);
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let generation = AtomicU64::new(0);
         let (tx5, rx5) = oneshot::channel();
 
@@ -1124,10 +1137,11 @@ pub(super) mod tests {
 
             // The caller times out: it drops its receiver and cancels.
             drop(rx5);
-            client_tx.send(DispatcherMessage::Cancel(5)).await.unwrap();
+            cancel_tx.send(5).unwrap();
 
-            // Request 6 reaching the server proves Cancel(5), queued before
-            // it, was processed.
+            // Request 6 reaching the server proves the cancel, sent before it,
+            // was processed: `run` handles every ready message before it waits
+            // again, and only then can the writer send request 6.
             let (tx6, rx6) = oneshot::channel();
             client_tx
                 .send(client_request(ping_with_sync(6), None, tx6))
@@ -1149,7 +1163,10 @@ pub(super) mod tests {
             drop(client_tx);
             server
         };
-        let (run_res, _server) = tokio::join!(conn.run(&mut client_rx, &generation), script);
+        let (run_res, _server) = tokio::join!(
+            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            script
+        );
 
         assert!(run_res.is_ok());
         assert!(logs_contain("Unknown sync 5"));
@@ -1159,8 +1176,8 @@ pub(super) mod tests {
     #[tokio::test]
     async fn sync_above_u32_reaches_its_caller() {
         let (conn, mut server) = connection_pair(real_writer).await;
-        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(4);
-        let mut client_rx = ReceiverStream::new(client_rx);
+        let (client_tx, mut client_rx) = mpsc::channel(4);
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let generation = AtomicU64::new(0);
         let sync = u64::from(u32::MAX) + 5;
         let (tx, rx) = oneshot::channel();
@@ -1180,13 +1197,112 @@ pub(super) mod tests {
             drop(client_tx);
             (server, response)
         };
-        let (run_res, (_server, response)) =
-            tokio::join!(conn.run(&mut client_rx, &generation), script);
+        let (run_res, (_server, response)) = tokio::join!(
+            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            script
+        );
 
         assert!(run_res.is_ok());
         assert!(
             matches!(response, Ok(Ok(ref r)) if r.sync == sync),
             "{response:?}"
         );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn cancel_reaches_run_while_the_request_queue_is_full() {
+        // A writer that never takes a request: request 1 fills the writer
+        // queue, the hand-off of request 2 stays pending, and `run` stops
+        // reading the request queue, which request 3 then fills.
+        let (conn, mut server) = connection_pair(|writer_rx, _write| async move {
+            let _writer_rx = writer_rx;
+            std::future::pending::<Result<(), CodecEncodeError>>().await
+        })
+        .await;
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let sender = DispatcherSender::new_for_test(client_tx.clone(), cancel_tx, Arc::default());
+        let generation = AtomicU64::new(0);
+
+        let script = async {
+            let mut first = Box::pin(sender.requests().send(ping_with_sync(1), None));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            let (tx2, _rx2) = oneshot::channel();
+            client_tx
+                .send(client_request(ping_with_sync(2), None, tx2))
+                .await
+                .unwrap();
+            let (tx3, _rx3) = oneshot::channel();
+            client_tx
+                .send(client_request(ping_with_sync(3), None, tx3))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(client_tx.capacity(), 0, "the request queue is not full");
+
+            // The caller of request 1 gives up, and its late response comes.
+            drop(first);
+            // Lets the cancel reach `run` before the late response, in any `join!` poll order.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server
+                .write_all(&ok_response(1, &Value::Map(Vec::new())))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // End of stream for the client's reader stops `run`.
+            drop(server);
+        };
+        let (run_res, ()) = tokio::join!(
+            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            script
+        );
+
+        assert!(run_res.is_err());
+        // The cancel removed the entry before the late response arrived.
+        assert!(logs_contain("Unknown sync 1"));
+        assert!(!logs_contain("Failed to pass response sync 1"));
+    }
+
+    #[tokio::test]
+    async fn cancel_before_its_queued_request_leaves_it_unsent() {
+        let (conn, mut server) = connection_pair(real_writer).await;
+        let (client_tx, mut client_rx) = mpsc::channel(4);
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let generation = AtomicU64::new(0);
+
+        // The caller of request 7 gave up while the request was queued: its
+        // receiver is closed and its cancel is already waiting.
+        let (tx7, rx7) = oneshot::channel();
+        drop(rx7);
+        cancel_tx.send(7).unwrap();
+        client_tx
+            .send(client_request(ping_with_sync(7), None, tx7))
+            .await
+            .unwrap();
+        let (tx8, rx8) = oneshot::channel();
+        client_tx
+            .send(client_request(ping_with_sync(8), None, tx8))
+            .await
+            .unwrap();
+
+        let script = async move {
+            // Only the control, request 8, reaches the server.
+            assert_eq!(read_request(&mut server).await.unwrap().1, 8);
+            server
+                .write_all(&ok_response(8, &Value::Map(Vec::new())))
+                .await
+                .unwrap();
+            let response = rx8.await;
+            drop(client_tx);
+            (server, response)
+        };
+        let (run_res, (_server, response)) = tokio::join!(
+            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            script
+        );
+
+        assert!(run_res.is_ok());
+        assert!(matches!(response, Ok(Ok(_))));
     }
 }
