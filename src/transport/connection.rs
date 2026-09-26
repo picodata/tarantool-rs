@@ -11,7 +11,7 @@ use futures::{
 };
 
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWrite},
     net::{
         TcpStream, ToSocketAddrs,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -21,10 +21,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::{
-    codec::{FramedRead, FramedWrite},
-    sync::CancellationToken,
-};
+use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, error, trace, warn};
 
 use super::dispatcher::{ClientRequest, DispatcherMessage, DispatcherResponseSender};
@@ -161,57 +158,45 @@ impl ConnectionData {
     }
 }
 
-// NOTE: here is weird logic, where task can be cancelld using token and when
-// rx closed. Token is necessary to close task when it currently sending to socket.
-async fn writer_task(
-    mut rx: mpsc::Receiver<EncodedRequest>,
-    mut stream: FramedWrite<OwnedWriteHalf, ClientCodec>,
-    cancellation_token: CancellationToken,
-) -> Result<(), (u64, CodecEncodeError)> {
-    let mut result = Ok(());
+/// Most requests the writer takes from its queue before it flushes.
+/// `FramedWrite` also flushes on its own at its 8 KiB backpressure boundary,
+/// so the limit only bounds how long a queued request waits for its flush.
+const WRITER_BATCH_LIMIT: usize = 16;
 
-    loop {
-        // NOTE: waiting for the next request must also be interruptible by the
-        // token: `writer_tx` lives in `Connection::run` until the very end of the
-        // function, so `rx.recv()` on its own never returns `None` and `run`
-        // would hang forever on `writer_task_handle.await`.
-        // `None` means the token was cancelled, `Some(None)` that the queue was
-        // closed; both end the loop.
-        let Some(Some(x)) = cancellation_token.run_until_cancelled(rx.recv()).await else {
-            break;
-        };
-        let sync = x.sync;
-        match cancellation_token.run_until_cancelled(stream.send(x)).await {
-            Some(Ok(())) => {}
-            Some(Err(err)) => {
-                result = Err((sync, err));
+/// Write queued requests to the socket until the queue closes.
+///
+/// Takes one request, then whatever else is already queued, up to
+/// [`WRITER_BATCH_LIMIT`] requests, and flushes once per batch; a lone
+/// request is written at once. `Connection::run` stops the task with
+/// `JoinHandle::abort`, which drops it at its next await, whether it waits for
+/// a request or for a socket the peer does not drain.
+async fn writer_task<W>(
+    mut rx: mpsc::Receiver<EncodedRequest>,
+    mut stream: FramedWrite<W, ClientCodec>,
+) -> Result<(), CodecEncodeError>
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(request) = rx.recv().await {
+        stream.feed(request).await?;
+        for _ in 1..WRITER_BATCH_LIMIT {
+            let Ok(request) = rx.try_recv() else {
                 break;
-            }
-            None => {
-                // Do not set error since task was cancelled externally.
-                // Should respond with ConnectionClosed in main task
-                break;
-            }
+            };
+            stream.feed(request).await?;
         }
+        stream.flush().await?;
     }
 
-    cancellation_token.cancel();
-
-    // TODO: reenable or pass strema back into main task
-    // if let Err(err) = stream.into_inner().shutdown().await {
-    //     warn!("Failed to shutdown TCP stream cleanly: {err}");
-    // }
-
-    result
+    Ok(())
 }
 
-type WriterTaskJoinHandle = JoinHandle<Result<(), (u64, CodecEncodeError)>>;
+type WriterTaskJoinHandle = JoinHandle<Result<(), CodecEncodeError>>;
 
 pub(crate) struct Connection {
     read_stream: FramedRead<OwnedReadHalf, ClientCodec>,
     writer_tx: mpsc::Sender<EncodedRequest>,
     writer_task_handle: WriterTaskJoinHandle,
-    writer_task_cancellation_token: CancellationToken,
     data: ConnectionData,
 }
 
@@ -271,18 +256,12 @@ impl Connection {
         let (writer_tx, writer_rx) = mpsc::channel(
             (internal_simultaneous_requests_threshold.saturating_mul(105) / 100).max(1),
         );
-        let writer_task_cancellation_token = CancellationToken::new();
-        let writer_task_handle = tokio::spawn(writer_task(
-            writer_rx,
-            write_stream,
-            writer_task_cancellation_token.clone(),
-        ));
+        let writer_task_handle = tokio::spawn(writer_task(writer_rx, write_stream));
 
         let this = Self {
             read_stream,
             writer_tx,
             writer_task_handle,
-            writer_task_cancellation_token,
             data: ConnectionData::default(),
         };
 
@@ -404,7 +383,6 @@ impl Connection {
             mut read_stream,
             writer_tx,
             writer_task_handle,
-            writer_task_cancellation_token,
             mut data,
         } = self;
 
@@ -464,16 +442,25 @@ impl Connection {
                 }
             }
         };
-        writer_task_cancellation_token.cancel();
 
-        // Wait for writer task to finish
-        match writer_task_handle.await {
+        // Stop the writer at once, whatever it waits for: its queue, or a
+        // socket the peer does not drain.
+        writer_task_handle.abort();
+        let writer_error = match writer_task_handle.await {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => Some(ConnectionError::from(err)),
+            // The abort above: the normal way the writer ends.
+            Err(err) if err.is_cancelled() => None,
             Err(err) => {
                 error!("Failed to await writer task's handle: {err}");
-                result = result.and(Err(err.into()));
+                Some(err.into())
             }
-            Ok(Err((sync, err))) => data.respond_to_client(sync, Err(err.into())),
-            Ok(Ok(())) => {}
+        };
+        // A write error cannot be pinned on one request of a batch. It explains
+        // the loss better than whatever ended the loop, and a failed writer
+        // never makes a clean shutdown.
+        if let Some(err) = writer_error {
+            result = Err(err);
         }
 
         // Every request registered in `in_flights` is answered here, whether it
@@ -493,28 +480,33 @@ impl Connection {
 pub(super) mod tests {
     use super::*;
     use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+    use tokio_util::codec::Encoder;
     use tracing_test::traced_test;
 
+    use std::io;
+    use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::task::{Context, Poll};
+
+    use bytes::BytesMut;
+    use parking_lot::Mutex;
 
     use rmpv::Value;
     use tokio::sync::oneshot;
 
     use crate::codec::consts::{RequestType, keys, response_codes::ERROR_RANGE_START};
-    use crate::{codec::request::Ping, transport::DispatcherSender};
+    use crate::codec::{
+        request::{Eval, Ping},
+        tests::greeting_with_salt,
+    };
+    use crate::transport::DispatcherSender;
 
-    /// Syntactically valid 128-byte greeting whose salt is 32 zero bytes.
+    /// Greeting whose salt is 32 zero bytes (base64: 43 'A' and one '=').
     fn fake_greeting() -> [u8; Greeting::SIZE] {
-        let mut buf = [b' '; Greeting::SIZE];
-        let line1 = b"Tarantool 2.11.0 (Binary) fake-uuid";
-        buf[..line1.len()].copy_from_slice(line1);
-        buf[63] = b'\n';
         let mut salt = [b'A'; 44];
         salt[43] = b'=';
-        buf[64..108].copy_from_slice(&salt);
-        buf[127] = b'\n';
-        buf
+        greeting_with_salt(&salt)
     }
 
     /// Read one request frame sent by the client and return its
@@ -527,16 +519,19 @@ pub(super) mod tests {
         let mut frame = vec![0u8; usize::try_from(len).unwrap()];
         sock.read_exact(&mut frame).await.ok()?;
         let header = rmpv::decode::read_value(&mut &frame[..]).unwrap();
-        let field = |key: u64| {
+        let field = |key: u8| {
             header
                 .as_map()
                 .unwrap()
                 .iter()
-                .find(|(k, _)| k.as_u64() == Some(key))
+                .find(|(k, _)| k.as_u64() == Some(u64::from(key)))
                 .and_then(|(_, v)| v.as_u64())
                 .unwrap()
         };
-        Some((u8::try_from(field(0x00)).unwrap(), field(0x01)))
+        Some((
+            u8::try_from(field(keys::REQUEST_TYPE)).unwrap(),
+            field(keys::SYNC),
+        ))
     }
 
     /// Response frame `{RESPONSE_CODE: code, SYNC: sync, SCHEMA_VERSION: 1}`
@@ -572,9 +567,9 @@ pub(super) mod tests {
     /// Body of an `IPROTO_ID` response: `{VERSION: 3, FEATURES: [0, 1, 2]}`.
     fn id_response_body() -> Value {
         Value::Map(vec![
-            (Value::from(0x54u8), Value::from(3u8)),
+            (Value::from(keys::VERSION), Value::from(3u8)),
             (
-                Value::from(0x55u8),
+                Value::from(keys::FEATURES),
                 Value::Array(vec![Value::from(0u8), Value::from(1u8), Value::from(2u8)]),
             ),
         ])
@@ -724,31 +719,52 @@ pub(super) mod tests {
         assert!(conn.is_ok());
     }
 
-    /// Build a connection over a local socket pair, with a custom writer task.
-    async fn connection_with_writer(
-        writer: impl Future<Output = Result<(), (u64, CodecEncodeError)>> + Send + 'static,
-    ) -> (Connection, TcpStream) {
+    /// Connection over a local socket pair, without a handshake. `writer`
+    /// builds the writer task from the writer queue (capacity 1) and the
+    /// socket's write half; the returned stream is the server side of the
+    /// socket.
+    async fn connection_pair<F, W>(writer: F) -> (Connection, TcpStream)
+    where
+        F: FnOnce(mpsc::Receiver<EncodedRequest>, OwnedWriteHalf) -> W,
+        W: Future<Output = Result<(), CodecEncodeError>> + Send + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
         let (server, _) = listener.accept().await.unwrap();
-        let (read, _write) = client.into_split();
-        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (read, write) = client.into_split();
+        let (writer_tx, writer_rx) = mpsc::channel(1);
         let conn = Connection {
             read_stream: FramedRead::new(read, ClientCodec::default()),
             writer_tx,
-            writer_task_handle: tokio::spawn(writer),
-            writer_task_cancellation_token: CancellationToken::new(),
+            writer_task_handle: tokio::spawn(writer(writer_rx, write)),
             data: ConnectionData::default(),
         };
         (conn, server)
     }
 
+    /// The writer task a real connection runs.
+    fn real_writer(
+        rx: mpsc::Receiver<EncodedRequest>,
+        write: OwnedWriteHalf,
+    ) -> impl Future<Output = Result<(), CodecEncodeError>> + Send + 'static {
+        writer_task(rx, FramedWrite::new(write, ClientCodec::default()))
+    }
+
+    /// Wait until the writer task has ended on its own, so that `run` joins
+    /// its outcome instead of aborting it first.
+    async fn writer_ended(conn: &Connection) {
+        while !conn.writer_task_handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test]
     async fn writer_task_panic_is_reported_as_error() {
         let (conn, _server) =
-            connection_with_writer(async { panic!("writer task panicked") }).await;
+            connection_pair(|_, _| async { panic!("writer task panicked") }).await;
+        writer_ended(&conn).await;
         let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(1);
         let mut client_rx = ReceiverStream::new(client_rx);
         drop(client_tx);
@@ -757,11 +773,149 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn writer_task_clean_exit_is_reported_as_ok() {
-        let (conn, _server) = connection_with_writer(async { Ok(()) }).await;
+        let (conn, _server) = connection_pair(|_, _| async { Ok(()) }).await;
+        writer_ended(&conn).await;
         let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(1);
         let mut client_rx = ReceiverStream::new(client_rx);
         drop(client_tx);
         assert!(conn.run(&mut client_rx, &AtomicU64::new(0)).await.is_ok());
+    }
+
+    /// In-memory write half that counts write and flush calls and keeps the
+    /// bytes it was given.
+    #[derive(Clone, Default)]
+    struct RecordingWriter {
+        writes: Arc<AtomicUsize>,
+        flushes: Arc<AtomicUsize>,
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.bytes.lock().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_flushes_queued_requests_once() {
+        let writer = RecordingWriter::default();
+        let (tx, rx) = mpsc::channel(8);
+        for sync in 1..=3 {
+            tx.send(ping_with_sync(sync)).await.unwrap();
+        }
+        drop(tx);
+
+        writer_task(rx, FramedWrite::new(writer.clone(), ClientCodec::default()))
+            .await
+            .unwrap();
+
+        // One batch: the three frames leave in one write and one flush.
+        assert_eq!(writer.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn writer_writes_a_lone_request_at_once() {
+        let writer = RecordingWriter::default();
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(writer_task(
+            rx,
+            FramedWrite::new(writer.clone(), ClientCodec::default()),
+        ));
+
+        tx.send(ping_with_sync(1)).await.unwrap();
+        // `tx` stays open, so a second request could still come.
+        timeout(Duration::from_secs(1), async {
+            while writer.flushes.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a lone request waited for a second one");
+        assert_eq!(writer.writes.load(Ordering::SeqCst), 1);
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_writes_every_request_past_the_batch_limit() {
+        let writer = RecordingWriter::default();
+        let (tx, rx) = mpsc::channel(64);
+        let mut expected = BytesMut::new();
+        for sync in 1..=40 {
+            tx.send(ping_with_sync(sync)).await.unwrap();
+            ClientCodec::default()
+                .encode(ping_with_sync(sync), &mut expected)
+                .unwrap();
+        }
+        drop(tx);
+
+        writer_task(rx, FramedWrite::new(writer.clone(), ClientCodec::default()))
+            .await
+            .unwrap();
+
+        // Batches of 16, 16 and 8, with every frame in queue order.
+        assert_eq!(writer.flushes.load(Ordering::SeqCst), 3);
+        assert_eq!(writer.bytes.lock().as_slice(), &expected[..]);
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_stops_promptly_on_teardown() {
+        // The peer never reads, so 32 requests of 1 MiB fill the socket
+        // buffers and block the writer inside a write.
+        let (conn, mut server) = connection_pair(real_writer).await;
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(64);
+        let mut client_rx = ReceiverStream::new(client_rx);
+        let generation = AtomicU64::new(0);
+        let expr = "x".repeat(1024 * 1024);
+        let mut receivers = Vec::new();
+        for sync in 1..=32 {
+            let mut request = EncodedRequest::new(&Eval::new(&expr, ()), None).unwrap();
+            *request.sync_mut() = sync;
+            let (tx, rx) = oneshot::channel();
+            client_tx
+                .send(client_request(request, None, tx))
+                .await
+                .unwrap();
+            receivers.push(rx);
+        }
+
+        let script = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // End of stream for the client's reader: `run` tears down while
+            // the writer is still blocked.
+            server.shutdown().await.unwrap();
+            tokio::time::Instant::now()
+        };
+        let (run_res, shut_down_at) = timeout(Duration::from_secs(5), async {
+            tokio::join!(conn.run(&mut client_rx, &generation), script)
+        })
+        .await
+        .expect("run waited for the blocked writer");
+
+        assert!(run_res.is_err());
+        assert!(
+            shut_down_at.elapsed() < Duration::from_secs(1),
+            "teardown took {:?}",
+            shut_down_at.elapsed()
+        );
+        drop(client_tx);
     }
 
     #[tokio::test]
@@ -812,7 +966,7 @@ pub(super) mod tests {
         // The writer queue's receiver is already gone, so handing the request
         // to the writer fails and the connection tears down while the request
         // is registered in `in_flights`.
-        let (conn, _server) = connection_with_writer(async { Ok(()) }).await;
+        let (conn, _server) = connection_pair(|_, _| async { Ok(()) }).await;
         let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(1);
         let mut client_rx = ReceiverStream::new(client_rx);
         let sender = DispatcherSender::new_for_test(client_tx, Arc::default());
@@ -858,31 +1012,6 @@ pub(super) mod tests {
             generation,
             responder: DispatcherResponseSender(tx),
         })
-    }
-
-    /// Connection over a local socket pair with the real writer task and no
-    /// handshake; the returned stream is the server side of the socket.
-    async fn connected_pair() -> (Connection, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        let (read, write) = client.into_split();
-        let (writer_tx, writer_rx) = mpsc::channel(8);
-        let token = CancellationToken::new();
-        let conn = Connection {
-            read_stream: FramedRead::new(read, ClientCodec::default()),
-            writer_tx,
-            writer_task_handle: tokio::spawn(writer_task(
-                writer_rx,
-                FramedWrite::new(write, ClientCodec::default()),
-                token.clone(),
-            )),
-            writer_task_cancellation_token: token,
-            data: ConnectionData::default(),
-        };
-        (conn, server)
     }
 
     #[test]
@@ -937,7 +1066,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn stale_stream_request_queued_across_reconnect_is_rejected() {
-        let (conn, mut server) = connected_pair().await;
+        let (conn, mut server) = connection_pair(real_writer).await;
         let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(4);
         let mut client_rx = ReceiverStream::new(client_rx);
         // The dispatcher already reconnected: this connection is generation 1.
@@ -980,7 +1109,7 @@ pub(super) mod tests {
     #[tokio::test]
     #[traced_test]
     async fn late_response_for_cancelled_sync_is_ignored() {
-        let (conn, mut server) = connected_pair().await;
+        let (conn, mut server) = connection_pair(real_writer).await;
         let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(4);
         let mut client_rx = ReceiverStream::new(client_rx);
         let generation = AtomicU64::new(0);
@@ -1029,7 +1158,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn sync_above_u32_reaches_its_caller() {
-        let (conn, mut server) = connected_pair().await;
+        let (conn, mut server) = connection_pair(real_writer).await;
         let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(4);
         let mut client_rx = ReceiverStream::new(client_rx);
         let generation = AtomicU64::new(0);

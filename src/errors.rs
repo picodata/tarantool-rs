@@ -368,6 +368,18 @@ impl From<CodecDecodeError> for ConnectionError {
     }
 }
 
+impl From<CodecEncodeError> for ConnectionError {
+    fn from(value: CodecEncodeError) -> Self {
+        match value {
+            CodecEncodeError::Io(x) => x.into(),
+            // Requests reach the writer encoded, so the codec only copies bytes
+            // into its buffer and never fails here; kept as the I/O error a
+            // failed write would be.
+            CodecEncodeError::Encode(x) => Self::Io(Arc::new(std::io::Error::other(x))),
+        }
+    }
+}
+
 impl From<JoinError> for ConnectionError {
     fn from(value: JoinError) -> Self {
         Self::JoinError(Arc::new(value))

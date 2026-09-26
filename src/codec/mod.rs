@@ -199,10 +199,11 @@ impl Greeting {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn greeting_with_salt(salt_b64: &[u8]) -> [u8; Greeting::SIZE] {
+    /// Greeting with `salt_b64` as its salt line and spaces everywhere else.
+    pub(crate) fn greeting_with_salt(salt_b64: &[u8]) -> [u8; Greeting::SIZE] {
         let mut buf = [b' '; Greeting::SIZE];
         buf[64..64 + salt_b64.len()].copy_from_slice(salt_b64);
         buf
