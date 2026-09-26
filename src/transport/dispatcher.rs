@@ -181,9 +181,11 @@ enum ReconnectOutcome {
 
 /// Dispatching messages from client to connection.
 ///
-/// Owns the reconnect loop, bumps the shared generation counter on every
-/// successful reconnect, and exits once the last client handle is dropped.
-/// Schema reloading and pooling are not implemented yet.
+/// Owns the reconnect loop and bumps the shared generation counter on every
+/// successful reconnect. It closes the connection and exits as soon as the
+/// last client handle is dropped, whether a connection is running or a
+/// reconnect is in progress. Schema reloading and pooling are not implemented
+/// yet.
 pub(crate) struct Dispatcher {
     rx: mpsc::Receiver<ClientRequest>,
     /// Syncs of the requests whose callers gave up. Unbounded, so a cancel is
@@ -196,8 +198,8 @@ pub(crate) struct Dispatcher {
     /// new connection. Streams and transactions compare it with the value
     /// they captured at creation.
     generation: Arc<AtomicU64>,
-    /// Its `closed()` resolves once every client handle is gone, even while
-    /// no connection is reading `rx`.
+    /// Its `closed()` resolves once every client handle is gone; both
+    /// `Connection::run` and `reconnect` race it.
     client_liveness: oneshot::Sender<()>,
 }
 
@@ -313,7 +315,12 @@ impl Dispatcher {
             match self.conn.take() {
                 Some(conn) => {
                     if conn
-                        .run(&mut self.rx, &mut self.cancel_rx, &self.generation)
+                        .run(
+                            &mut self.rx,
+                            &mut self.cancel_rx,
+                            &mut self.client_liveness,
+                            &self.generation,
+                        )
                         .await
                         .is_ok()
                     {
@@ -409,9 +416,12 @@ impl From<&ReconnectInterval> for ReconnectIntervalState {
 mod tests {
     use super::*;
 
-    use tokio::net::TcpListener;
+    use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
 
-    use super::super::connection::tests::{echo_sync, spawn_fake_server};
+    use super::super::connection::tests::{
+        echo_sync, fake_greeting, id_response_body, ok_response, read_request, spawn_fake_server,
+    };
+    use crate::codec::{consts::RequestType, request::Eval};
 
     /// Dispatcher with no live connection whose factory connects to `addr`.
     fn dispatcher_for(
@@ -434,6 +444,63 @@ mod tests {
     async fn dead_endpoint() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().to_string()
+    }
+
+    /// Fake server that completes the handshake of every connection, then
+    /// holds the socket and never reads from it again.
+    async fn spawn_non_reading_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    sock.write_all(&fake_greeting()).await.unwrap();
+                    let (request_type, sync) = read_request(&mut sock).await.unwrap();
+                    assert_eq!(request_type, RequestType::Id as u8);
+                    sock.write_all(&ok_response(sync, &id_response_body()))
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn dispatcher_exits_when_last_handle_drops_while_the_peer_does_not_read() {
+        let addr = spawn_non_reading_server().await;
+        let (dispatcher, sender) = dispatcher_for(
+            addr,
+            Some(ReconnectInterval::fixed(Duration::from_millis(10))),
+        );
+        let dispatcher = tokio::spawn(dispatcher.run());
+
+        // Requests of 1 MiB fill the socket buffers, the writer queue (16)
+        // and the dispatcher queue (4); the rest wait for queue capacity.
+        let sender = Arc::new(sender);
+        let expr = "x".repeat(1024 * 1024);
+        let mut requests = Vec::new();
+        for sync in 1..=40 {
+            let mut request = EncodedRequest::new(&Eval::new(&expr, ()), None).unwrap();
+            *request.sync_mut() = sync;
+            let sender = sender.clone();
+            requests.push(tokio::spawn(async move {
+                sender.requests().send(request, None).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The application drops every handle, its pending requests included.
+        for request in &requests {
+            request.abort();
+        }
+        drop(sender);
+
+        timeout(Duration::from_secs(1), dispatcher)
+            .await
+            .expect("the dispatcher outlived the last client handle")
+            .unwrap();
     }
 
     #[tokio::test]

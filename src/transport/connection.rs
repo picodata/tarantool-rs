@@ -17,7 +17,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     pin,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -369,14 +369,22 @@ impl Connection {
         connection_data.respond_to_client(response.sync, Ok(response));
     }
 
-    /// Run connection until it breaks of `rx` is closed.
+    /// Run the connection until it breaks or the last client handle is gone.
     ///
-    /// `Ok` means `rx` was closed and connection should not be restarted.
-    /// `Err` means connection was dropped due to some error.
+    /// `Ok(())` means every client handle was dropped: the dispatcher stops,
+    /// and the connection must not be restarted. `Err(())` means the
+    /// connection was lost.
+    ///
+    /// `client_liveness` is raced in an arm that is never gated, so `run`
+    /// stops as soon as the last handle drops, whatever it waits for. Teardown
+    /// then aborts the writer and answers every in-flight request with the
+    /// error that ended the connection, or with `ConnectionClosed` when the
+    /// clients are gone.
     pub(crate) async fn run(
         self,
         client_rx: &mut mpsc::Receiver<ClientRequest>,
         cancel_rx: &mut mpsc::UnboundedReceiver<u64>,
+        client_liveness: &mut oneshot::Sender<()>,
         current_generation: &AtomicU64,
     ) -> Result<(), ()> {
         let Self {
@@ -391,6 +399,13 @@ impl Connection {
 
         let mut result = loop {
             tokio::select! {
+                // Never gated: the last client handle can go away while the
+                // loop waits for anything, a writer that cannot write included.
+                () = client_liveness.closed() => {
+                    debug!("All client handles dropped");
+                    break Ok(());
+                }
+
                 // Read value from TCP stream
                 next = Connection::get_next_stream_value(&mut read_stream) => {
                     match next {
@@ -461,8 +476,9 @@ impl Connection {
             result = Err(err);
         }
 
-        // Every request registered in `in_flights` is answered here, whether it
-        // was queued for the writer, being written, or awaiting its response.
+        // Every request still registered is answered with the error that
+        // ended the connection, or with `ConnectionClosed` once the clients are
+        // gone.
         data.send_error_to_all_in_flights(
             &result
                 .clone()
@@ -501,7 +517,7 @@ pub(super) mod tests {
     use crate::transport::DispatcherSender;
 
     /// Greeting whose salt is 32 zero bytes (base64: 43 'A' and one '=').
-    fn fake_greeting() -> [u8; Greeting::SIZE] {
+    pub(crate) fn fake_greeting() -> [u8; Greeting::SIZE] {
         let mut salt = [b'A'; 44];
         salt[43] = b'=';
         greeting_with_salt(&salt)
@@ -509,7 +525,7 @@ pub(super) mod tests {
 
     /// Read one request frame sent by the client and return its
     /// `(request_type, sync)`, or `None` once the client closed the socket.
-    async fn read_request(sock: &mut TcpStream) -> Option<(u8, u64)> {
+    pub(crate) async fn read_request(sock: &mut TcpStream) -> Option<(u8, u64)> {
         // `ClientCodec` always writes the length as MP_UINT64: 0xcf + 8 bytes.
         let mut len_buf = [0u8; 9];
         sock.read_exact(&mut len_buf).await.ok()?;
@@ -551,7 +567,7 @@ pub(super) mod tests {
     }
 
     /// Response frame `{RESPONSE_CODE: 0, SYNC: sync, SCHEMA_VERSION: 1}` + `body`.
-    fn ok_response(sync: u64, body: &Value) -> Vec<u8> {
+    pub(crate) fn ok_response(sync: u64, body: &Value) -> Vec<u8> {
         response_frame(0, sync, body)
     }
 
@@ -563,7 +579,7 @@ pub(super) mod tests {
     }
 
     /// Body of an `IPROTO_ID` response: `{VERSION: 3, FEATURES: [0, 1, 2]}`.
-    fn id_response_body() -> Value {
+    pub(crate) fn id_response_body() -> Value {
         Value::Map(vec![
             (Value::from(keys::VERSION), Value::from(3u8)),
             (
@@ -575,7 +591,7 @@ pub(super) mod tests {
 
     /// OK body for a request of `request_type`: an `IPROTO_ID` body for ID
     /// requests, an empty map for the rest.
-    fn ok_body_for(request_type: u8) -> Value {
+    pub(crate) fn ok_body_for(request_type: u8) -> Value {
         if request_type == RequestType::Id as u8 {
             id_response_body()
         } else {
@@ -765,11 +781,17 @@ pub(super) mod tests {
         writer_ended(&conn).await;
         let (client_tx, mut client_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, _client_handle) = oneshot::channel();
         drop(client_tx);
         assert!(
-            conn.run(&mut client_rx, &mut cancel_rx, &AtomicU64::new(0))
-                .await
-                .is_err()
+            conn.run(
+                &mut client_rx,
+                &mut cancel_rx,
+                &mut client_liveness,
+                &AtomicU64::new(0)
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -779,11 +801,17 @@ pub(super) mod tests {
         writer_ended(&conn).await;
         let (client_tx, mut client_rx) = mpsc::channel(1);
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, _client_handle) = oneshot::channel();
         drop(client_tx);
         assert!(
-            conn.run(&mut client_rx, &mut cancel_rx, &AtomicU64::new(0))
-                .await
-                .is_ok()
+            conn.run(
+                &mut client_rx,
+                &mut cancel_rx,
+                &mut client_liveness,
+                &AtomicU64::new(0)
+            )
+            .await
+            .is_ok()
         );
     }
 
@@ -888,6 +916,7 @@ pub(super) mod tests {
         let (conn, mut server) = connection_pair(real_writer).await;
         let (client_tx, mut client_rx) = mpsc::channel(64);
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, _client_handle) = oneshot::channel();
         let generation = AtomicU64::new(0);
         let expr = "x".repeat(1024 * 1024);
         let mut receivers = Vec::new();
@@ -911,7 +940,12 @@ pub(super) mod tests {
         };
         let (run_res, shut_down_at) = timeout(Duration::from_secs(5), async {
             tokio::join!(
-                conn.run(&mut client_rx, &mut cancel_rx, &generation),
+                conn.run(
+                    &mut client_rx,
+                    &mut cancel_rx,
+                    &mut client_liveness,
+                    &generation
+                ),
                 script
             )
         })
@@ -978,6 +1012,7 @@ pub(super) mod tests {
         let (conn, _server) = connection_pair(|_, _| async { Ok(()) }).await;
         let (client_tx, mut client_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, _client_handle) = oneshot::channel();
         let sender = DispatcherSender::new_for_test(client_tx, cancel_tx, Arc::default());
         // `join!` borrows across its whole body, so the generation needs a
         // binding rather than a temporary.
@@ -986,7 +1021,12 @@ pub(super) mod tests {
         // `join!` keeps both futures inside the test's tracing span, which
         // `logs_contain` needs; a spawned task would log outside it.
         let (run_res, send_res) = tokio::join!(
-            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            conn.run(
+                &mut client_rx,
+                &mut cancel_rx,
+                &mut client_liveness,
+                &generation
+            ),
             sender
                 .requests()
                 .send(EncodedRequest::new(&Ping {}, None).unwrap(), None),
@@ -1080,6 +1120,7 @@ pub(super) mod tests {
         let (conn, mut server) = connection_pair(real_writer).await;
         let (client_tx, mut client_rx) = mpsc::channel(4);
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, _client_handle) = oneshot::channel();
         // The dispatcher already reconnected: this connection is generation 1.
         let generation = AtomicU64::new(1);
         let (stale_tx, stale_rx) = oneshot::channel();
@@ -1110,7 +1151,12 @@ pub(super) mod tests {
             (server, stale_rx.await, plain)
         };
         let (run_res, (_server, stale, plain)) = tokio::join!(
-            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            conn.run(
+                &mut client_rx,
+                &mut cancel_rx,
+                &mut client_liveness,
+                &generation
+            ),
             script
         );
 
@@ -1125,6 +1171,7 @@ pub(super) mod tests {
         let (conn, mut server) = connection_pair(real_writer).await;
         let (client_tx, mut client_rx) = mpsc::channel(4);
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, _client_handle) = oneshot::channel();
         let generation = AtomicU64::new(0);
         let (tx5, rx5) = oneshot::channel();
 
@@ -1164,7 +1211,12 @@ pub(super) mod tests {
             server
         };
         let (run_res, _server) = tokio::join!(
-            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            conn.run(
+                &mut client_rx,
+                &mut cancel_rx,
+                &mut client_liveness,
+                &generation
+            ),
             script
         );
 
@@ -1178,6 +1230,7 @@ pub(super) mod tests {
         let (conn, mut server) = connection_pair(real_writer).await;
         let (client_tx, mut client_rx) = mpsc::channel(4);
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, _client_handle) = oneshot::channel();
         let generation = AtomicU64::new(0);
         let sync = u64::from(u32::MAX) + 5;
         let (tx, rx) = oneshot::channel();
@@ -1198,7 +1251,12 @@ pub(super) mod tests {
             (server, response)
         };
         let (run_res, (_server, response)) = tokio::join!(
-            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            conn.run(
+                &mut client_rx,
+                &mut cancel_rx,
+                &mut client_liveness,
+                &generation
+            ),
             script
         );
 
@@ -1222,6 +1280,7 @@ pub(super) mod tests {
         .await;
         let (client_tx, mut client_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, _client_handle) = oneshot::channel();
         let sender = DispatcherSender::new_for_test(client_tx.clone(), cancel_tx, Arc::default());
         let generation = AtomicU64::new(0);
 
@@ -1254,7 +1313,12 @@ pub(super) mod tests {
             drop(server);
         };
         let (run_res, ()) = tokio::join!(
-            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            conn.run(
+                &mut client_rx,
+                &mut cancel_rx,
+                &mut client_liveness,
+                &generation
+            ),
             script
         );
 
@@ -1269,6 +1333,7 @@ pub(super) mod tests {
         let (conn, mut server) = connection_pair(real_writer).await;
         let (client_tx, mut client_rx) = mpsc::channel(4);
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, _client_handle) = oneshot::channel();
         let generation = AtomicU64::new(0);
 
         // The caller of request 7 gave up while the request was queued: its
@@ -1298,11 +1363,60 @@ pub(super) mod tests {
             (server, response)
         };
         let (run_res, (_server, response)) = tokio::join!(
-            conn.run(&mut client_rx, &mut cancel_rx, &generation),
+            conn.run(
+                &mut client_rx,
+                &mut cancel_rx,
+                &mut client_liveness,
+                &generation
+            ),
             script
         );
 
         assert!(run_res.is_ok());
         assert!(matches!(response, Ok(Ok(_))));
+    }
+
+    #[tokio::test]
+    async fn last_handle_dropped_stops_run_without_waiting_for_responses() {
+        let (conn, mut server) = connection_pair(real_writer).await;
+        let (client_tx, mut client_rx) = mpsc::channel(4);
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, client_handle) = oneshot::channel();
+        let generation = AtomicU64::new(0);
+        let (tx, rx) = oneshot::channel();
+
+        let script = async move {
+            client_tx
+                .send(client_request(ping_with_sync(1), None, tx))
+                .await
+                .unwrap();
+            // Registered and written; the server never answers it.
+            assert_eq!(read_request(&mut server).await.unwrap().1, 1);
+            // The last client handle goes away while the request queue stays
+            // open.
+            drop(client_handle);
+            let response = timeout(Duration::from_secs(1), rx)
+                .await
+                .expect("run waited for the response");
+            (server, client_tx, response)
+        };
+        let (run_res, (_server, _client_tx, response)) = tokio::join!(
+            conn.run(
+                &mut client_rx,
+                &mut cancel_rx,
+                &mut client_liveness,
+                &generation
+            ),
+            script
+        );
+
+        assert!(
+            run_res.is_ok(),
+            "the last handle going away is a clean stop"
+        );
+        assert!(
+            matches!(response, Ok(Err(Error::ConnectionClosed))),
+            "{response:?}"
+        );
     }
 }
