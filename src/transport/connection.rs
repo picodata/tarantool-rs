@@ -10,7 +10,6 @@ use futures::{
     future::{Fuse, FusedFuture},
 };
 
-use parking_lot::RwLock;
 use tokio::{
     io::AsyncReadExt,
     net::{
@@ -32,16 +31,25 @@ use super::dispatcher::{ClientRequest, DispatcherMessage, DispatcherResponseSend
 use crate::{
     codec::{
         ClientCodec, Greeting,
-        request::{Auth, ConnectionFeatures, EncodedRequest, Id},
+        request::{Auth, EncodedRequest, Id, Request},
         response::{Response, ResponseBody},
     },
-    errors::{CodecEncodeError, ConnectionError, Error},
+    errors::{CodecEncodeError, ConnectionError, EncodingError, Error},
 };
 
-/// Sync of the AUTH and ID handshake requests. Nothing else is in flight
-/// during the handshake and both responses are read synchronously, so it
-/// cannot collide with the client-assigned syncs used afterwards.
-const HANDSHAKE_SYNC: u64 = 0;
+/// Sync of the AUTH request of the handshake. The handshake finishes before
+/// `run` starts, so the handshake syncs cannot collide with the
+/// client-assigned syncs used afterwards.
+const AUTH_SYNC: u64 = 0;
+/// Sync of the ID request of the handshake; see [`AUTH_SYNC`].
+const ID_SYNC: u64 = 1;
+
+/// Encode one handshake request with its fixed sync.
+fn handshake_request(body: &impl Request, sync: u64) -> Result<EncodedRequest, EncodingError> {
+    let mut request = EncodedRequest::new(body, None)?;
+    *request.sync_mut() = sync;
+    Ok(request)
+}
 
 struct ConnectionData {
     in_flights: HashMap<u64, DispatcherResponseSender>,
@@ -213,7 +221,6 @@ impl Connection {
         user: Option<&str>,
         password: Option<&str>,
         internal_simultaneous_requests_threshold: usize,
-        features: &RwLock<ConnectionFeatures>,
     ) -> Result<Self, Error>
     where
         A: ToSocketAddrs + Display,
@@ -232,22 +239,32 @@ impl Connection {
         let mut read_stream = FramedRead::new(read_tcp_stream, ClientCodec::default());
         let mut write_stream = FramedWrite::new(write_tcp_stream, ClientCodec::default());
 
-        if let Some(user) = user {
-            Self::auth(
-                &mut read_stream,
-                &mut write_stream,
-                user,
-                password,
-                &greeting.salt,
-            )
-            .await?;
-        }
-
+        let auth = user
+            .map(|user| handshake_request(&Auth::new(user, password, &greeting.salt), AUTH_SYNC))
+            .transpose()?;
         // TODO: add option to disable pre 2.10 features (ID request, streams, watchers)
-        // Runs on every connection, so a reconnect re-negotiates features.
-        let negotiated = Self::id(&mut read_stream, &mut write_stream).await?;
-        debug!("Negotiated features: {:?}", negotiated);
-        *features.write() = negotiated;
+        // Sent on every connection: a session enables exactly the features the
+        // client lists, so a reconnected session gets them as well.
+        let id = Id::default();
+        debug!("Sending IPROTO_ID: {:?}", id);
+        let (auth_body, id_body) = Self::handshake(
+            &mut read_stream,
+            &mut write_stream,
+            auth,
+            handshake_request(&id, ID_SYNC)?,
+        )
+        .await?;
+        // When both fail, the AUTH error wins: it is the actionable one.
+        if let Some(ResponseBody::Error(err)) = auth_body {
+            return Err(Error::Auth(err));
+        }
+        match id_body {
+            // The server's own version and features, not a negotiated set.
+            ResponseBody::Ok(body) => {
+                debug!("Server capabilities from the IPROTO_ID reply: {}", body);
+            }
+            ResponseBody::Error(err) => return Err(Error::Response(err)),
+        }
 
         // TODO: review size of this queue
         // Make this queue slightly larger than queue between Client and Dispatcher
@@ -278,7 +295,6 @@ impl Connection {
         password: Option<&str>,
         timeout: Option<Duration>,
         internal_simultaneous_requests_threshold: usize,
-        features: &RwLock<ConnectionFeatures>,
     ) -> Result<Self, Error>
     where
         A: ToSocketAddrs + Display,
@@ -291,7 +307,6 @@ impl Connection {
                     user,
                     password,
                     internal_simultaneous_requests_threshold,
-                    features,
                 ),
             )
             .await
@@ -303,64 +318,57 @@ impl Connection {
                     user,
                     password,
                     internal_simultaneous_requests_threshold,
-                    features,
                 )
                 .await
             }
         }
     }
 
-    async fn auth(
+    /// Send AUTH (when `auth` is set) and `IPROTO_ID` in one write, then read
+    /// one reply per request and return the bodies of the AUTH and ID replies.
+    ///
+    /// The server may run the two requests on different fibers, so the ID
+    /// reply can come first; replies are matched by sync. A reply with an
+    /// unknown or repeated sync fails the handshake.
+    async fn handshake(
         read_stream: &mut FramedRead<OwnedReadHalf, ClientCodec>,
         write_stream: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
-        user: &str,
-        password: Option<&str>,
-        salt: &[u8],
-    ) -> Result<(), Error> {
-        let mut request = EncodedRequest::new(&Auth::new(user, password, salt), None).unwrap();
-        *request.sync_mut() = HANDSHAKE_SYNC;
-
-        trace!("Sending auth request");
-        write_stream.send(request).await?;
-
-        let resp = Self::get_next_stream_value(read_stream).await?;
-        if resp.sync != HANDSHAKE_SYNC {
-            return Err(Error::Other(anyhow::anyhow!(
-                "Unexpected sync {} in auth response, expected {}",
-                resp.sync,
-                HANDSHAKE_SYNC
-            )));
+        auth: Option<EncodedRequest>,
+        id: EncodedRequest,
+    ) -> Result<(Option<ResponseBody>, ResponseBody), Error> {
+        let auth_sync = auth.as_ref().map(|request| request.sync);
+        let id_sync = id.sync;
+        trace!("Sending handshake requests");
+        for request in auth.into_iter().chain([id]) {
+            write_stream.feed(request).await?;
         }
-        match resp.body {
-            ResponseBody::Ok(_x) => Ok(()),
-            ResponseBody::Error(err) => Err(Error::Auth(err)),
-        }
-    }
+        write_stream.flush().await?;
 
-    /// Send `IPROTO_ID` with the features this crate supports and return what
-    /// the server agreed to. Same raw-stream pattern as [`Self::auth`].
-    async fn id(
-        read_stream: &mut FramedRead<OwnedReadHalf, ClientCodec>,
-        write_stream: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
-    ) -> Result<ConnectionFeatures, Error> {
-        let mut request = EncodedRequest::new(&Id::default(), None)?;
-        *request.sync_mut() = HANDSHAKE_SYNC;
-
-        trace!("Sending ID request");
-        write_stream.send(request).await?;
-
-        let resp = Self::get_next_stream_value(read_stream).await?;
-        if resp.sync != HANDSHAKE_SYNC {
-            return Err(Error::Other(anyhow::anyhow!(
-                "Unexpected sync {} in ID response, expected {}",
-                resp.sync,
-                HANDSHAKE_SYNC
-            )));
+        let unexpected = |sync: u64| {
+            Error::Other(anyhow::anyhow!(
+                "Unexpected sync {sync} in handshake response"
+            ))
+        };
+        let mut auth_body = None;
+        let id_body = loop {
+            let response = Self::get_next_stream_value(read_stream).await?;
+            if response.sync == id_sync {
+                break response.body;
+            }
+            if Some(response.sync) != auth_sync || auth_body.is_some() {
+                return Err(unexpected(response.sync));
+            }
+            auth_body = Some(response.body);
+        };
+        // The ID reply came first: the AUTH reply is still on its way.
+        if auth_sync.is_some() && auth_body.is_none() {
+            let response = Self::get_next_stream_value(read_stream).await?;
+            if Some(response.sync) != auth_sync {
+                return Err(unexpected(response.sync));
+            }
+            auth_body = Some(response.body);
         }
-        match resp.body {
-            ResponseBody::Ok(body) => Ok(ConnectionFeatures::decode(&body)?),
-            ResponseBody::Error(err) => Err(Error::Response(err)),
-        }
+        Ok((auth_body, id_body))
     }
 
     #[inline]
@@ -484,18 +492,16 @@ impl Connection {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use tokio::{io::AsyncWriteExt, net::TcpListener};
+    use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
     use tracing_test::traced_test;
 
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
-    use parking_lot::RwLock;
     use rmpv::Value;
     use tokio::sync::oneshot;
 
-    use crate::codec::consts::RequestType;
-    use crate::codec::request::ConnectionFeatures;
+    use crate::codec::consts::{RequestType, keys, response_codes::ERROR_RANGE_START};
     use crate::{codec::request::Ping, transport::DispatcherSender};
 
     /// Syntactically valid 128-byte greeting whose salt is 32 zero bytes.
@@ -533,21 +539,34 @@ pub(super) mod tests {
         Some((u8::try_from(field(0x00)).unwrap(), field(0x01)))
     }
 
-    /// Response frame `{RESPONSE_CODE: 0, SYNC: sync, SCHEMA_VERSION: 1}` + `body`.
-    fn ok_response(sync: u64, body: &Value) -> Vec<u8> {
+    /// Response frame `{RESPONSE_CODE: code, SYNC: sync, SCHEMA_VERSION: 1}`
+    /// followed by `body`.
+    fn response_frame(code: u32, sync: u64, body: &Value) -> Vec<u8> {
         let mut payload = Vec::new();
         rmp::encode::write_map_len(&mut payload, 3).unwrap();
-        rmp::encode::write_pfix(&mut payload, 0x00).unwrap();
-        rmp::encode::write_pfix(&mut payload, 0x00).unwrap();
-        rmp::encode::write_pfix(&mut payload, 0x01).unwrap();
+        rmp::encode::write_pfix(&mut payload, keys::RESPONSE_CODE).unwrap();
+        rmp::encode::write_uint(&mut payload, u64::from(code)).unwrap();
+        rmp::encode::write_pfix(&mut payload, keys::SYNC).unwrap();
         rmp::encode::write_uint(&mut payload, sync).unwrap();
-        rmp::encode::write_pfix(&mut payload, 0x05).unwrap();
-        rmp::encode::write_pfix(&mut payload, 0x01).unwrap();
+        rmp::encode::write_pfix(&mut payload, keys::SCHEMA_VERSION).unwrap();
+        rmp::encode::write_pfix(&mut payload, 1).unwrap();
         rmpv::encode::write_value(&mut payload, body).unwrap();
         let mut frame = Vec::new();
         rmp::encode::write_u32(&mut frame, u32::try_from(payload.len()).unwrap()).unwrap();
         frame.extend_from_slice(&payload);
         frame
+    }
+
+    /// Response frame `{RESPONSE_CODE: 0, SYNC: sync, SCHEMA_VERSION: 1}` + `body`.
+    fn ok_response(sync: u64, body: &Value) -> Vec<u8> {
+        response_frame(0, sync, body)
+    }
+
+    /// Error response frame for Tarantool error `code`, whose description is
+    /// `message`.
+    fn error_response(sync: u64, code: u32, message: &str) -> Vec<u8> {
+        let body = Value::Map(vec![(Value::from(keys::ERROR_24), Value::from(message))]);
+        response_frame(ERROR_RANGE_START + code, sync, &body)
     }
 
     /// Body of an `IPROTO_ID` response: `{VERSION: 3, FEATURES: [0, 1, 2]}`.
@@ -559,6 +578,16 @@ pub(super) mod tests {
                 Value::Array(vec![Value::from(0u8), Value::from(1u8), Value::from(2u8)]),
             ),
         ])
+    }
+
+    /// OK body for a request of `request_type`: an `IPROTO_ID` body for ID
+    /// requests, an empty map for the rest.
+    fn ok_body_for(request_type: u8) -> Value {
+        if request_type == RequestType::Id as u8 {
+            id_response_body()
+        } else {
+            Value::Map(Vec::new())
+        }
     }
 
     /// `sync_for` that answers every request with its own sync.
@@ -580,12 +609,8 @@ pub(super) mod tests {
                         return;
                     }
                     while let Some((request_type, sync)) = read_request(&mut sock).await {
-                        let body = if request_type == RequestType::Id as u8 {
-                            id_response_body()
-                        } else {
-                            Value::Map(Vec::new())
-                        };
-                        let response = ok_response(sync_for(request_type, sync), &body);
+                        let response =
+                            ok_response(sync_for(request_type, sync), &ok_body_for(request_type));
                         if sock.write_all(&response).await.is_err() {
                             return;
                         }
@@ -596,10 +621,106 @@ pub(super) mod tests {
         addr
     }
 
+    /// Builds the reply frames from the `(request_type, sync)` pairs of the
+    /// handshake requests.
+    type HandshakeAnswer = fn(&[(u8, u64)]) -> Vec<Vec<u8>>;
+
+    /// Fake server for one handshake: writes the greeting and reads
+    /// `expected` requests before it answers any of them, then writes the
+    /// frames `answer` builds. A client that waits for one reply before it
+    /// sends the next request hangs here.
+    async fn spawn_handshake_server(expected: usize, answer: HandshakeAnswer) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&fake_greeting()).await.unwrap();
+            let mut requests = Vec::new();
+            for _ in 0..expected {
+                requests.push(read_request(&mut sock).await.unwrap());
+            }
+            for frame in answer(&requests) {
+                sock.write_all(&frame).await.unwrap();
+            }
+            // Keep the socket open until the client closes it.
+            let _ = read_request(&mut sock).await;
+        });
+        addr
+    }
+
+    /// Replies to handshake requests in request order; request types listed
+    /// in `failing` get an error reply.
+    fn replies(requests: &[(u8, u64)], failing: &[RequestType]) -> Vec<Vec<u8>> {
+        requests
+            .iter()
+            .map(|&(request_type, sync)| {
+                if failing.iter().any(|x| *x as u8 == request_type) {
+                    error_response(sync, 1, "rejected")
+                } else {
+                    ok_response(sync, &ok_body_for(request_type))
+                }
+            })
+            .collect()
+    }
+
+    /// Handshake as "user" against `addr`, bounded, so a client that does not
+    /// pipeline AUTH and ID fails instead of hanging.
+    async fn handshake_as_user(addr: String) -> Result<Connection, Error> {
+        timeout(
+            Duration::from_secs(1),
+            Connection::new_inner(addr, Some("user"), Some("pass"), 500),
+        )
+        .await
+        .expect("the client waited for the AUTH reply before sending ID")
+    }
+
+    #[tokio::test]
+    async fn auth_and_id_are_sent_before_any_reply() {
+        let addr = spawn_handshake_server(2, |requests| replies(requests, &[])).await;
+        assert!(handshake_as_user(addr).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn id_reply_before_auth_reply_completes_the_handshake() {
+        let addr = spawn_handshake_server(2, |requests| {
+            let mut frames = replies(requests, &[]);
+            frames.reverse();
+            frames
+        })
+        .await;
+        assert!(handshake_as_user(addr).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_auth_is_an_auth_error() {
+        let addr =
+            spawn_handshake_server(2, |requests| replies(requests, &[RequestType::Auth])).await;
+        assert!(matches!(handshake_as_user(addr).await, Err(Error::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn failed_id_is_a_response_error() {
+        let addr =
+            spawn_handshake_server(2, |requests| replies(requests, &[RequestType::Id])).await;
+        assert!(matches!(
+            handshake_as_user(addr).await,
+            Err(Error::Response(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_error_wins_when_auth_and_id_fail() {
+        let addr = spawn_handshake_server(2, |requests| {
+            replies(requests, &[RequestType::Auth, RequestType::Id])
+        })
+        .await;
+        assert!(matches!(handshake_as_user(addr).await, Err(Error::Auth(_))));
+    }
+
     #[tokio::test]
     async fn small_threshold_does_not_panic() {
         let addr = spawn_fake_server(echo_sync).await;
-        let conn = Connection::new_inner(addr, None, None, 50, &RwLock::default()).await;
+        let conn = Connection::new_inner(addr, None, None, 50).await;
         assert!(conn.is_ok());
     }
 
@@ -646,15 +767,14 @@ pub(super) mod tests {
     #[tokio::test]
     async fn default_threshold_does_not_panic() {
         let addr = spawn_fake_server(echo_sync).await;
-        let conn = Connection::new_inner(addr, None, None, 500, &RwLock::default()).await;
+        let conn = Connection::new_inner(addr, None, None, 500).await;
         assert!(conn.is_ok());
     }
 
     #[tokio::test]
     async fn auth_response_with_matching_sync_is_accepted() {
         let addr = spawn_fake_server(echo_sync).await;
-        let conn =
-            Connection::new_inner(addr, Some("user"), Some("pass"), 500, &RwLock::default()).await;
+        let conn = Connection::new_inner(addr, Some("user"), Some("pass"), 500).await;
         assert!(conn.is_ok());
     }
 
@@ -668,28 +788,8 @@ pub(super) mod tests {
             }
         })
         .await;
-        let conn =
-            Connection::new_inner(addr, Some("user"), Some("pass"), 500, &RwLock::default()).await;
+        let conn = Connection::new_inner(addr, Some("user"), Some("pass"), 500).await;
         assert!(matches!(conn, Err(Error::Other(_))));
-    }
-
-    #[tokio::test]
-    async fn handshake_records_negotiated_features() {
-        let addr = spawn_fake_server(echo_sync).await;
-        let features = RwLock::new(ConnectionFeatures::default());
-        Connection::new_inner(addr, None, None, 500, &features)
-            .await
-            .unwrap();
-        assert_eq!(
-            *features.read(),
-            ConnectionFeatures {
-                protocol_version: 3,
-                streams: true,
-                transactions: true,
-                error_extension: true,
-                watchers: false,
-            }
-        );
     }
 
     #[tokio::test]
@@ -702,7 +802,7 @@ pub(super) mod tests {
             }
         })
         .await;
-        let conn = Connection::new_inner(addr, None, None, 500, &RwLock::default()).await;
+        let conn = Connection::new_inner(addr, None, None, 500).await;
         assert!(matches!(conn, Err(Error::Other(_))));
     }
 

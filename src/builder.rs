@@ -1,13 +1,9 @@
-use std::{cmp::max, fmt::Display, sync::Arc, time::Duration};
+use std::{cmp::max, fmt::Display, time::Duration};
 
-use parking_lot::RwLock;
 use tokio::net::ToSocketAddrs;
-use tracing::debug;
 
 use crate::{
-    client::Connection,
-    codec::{consts::TransactionIsolationLevel, request::ConnectionFeatures},
-    errors::Error,
+    client::Connection, codec::consts::TransactionIsolationLevel, errors::Error,
     transport::Dispatcher,
 };
 
@@ -105,7 +101,6 @@ impl ConnectionBuilder {
     where
         A: ToSocketAddrs + Display + Clone + Send + Sync + 'static,
     {
-        let features = Arc::new(RwLock::new(ConnectionFeatures::default()));
         let (dispatcher_fut, dispatcher_sender) = Dispatcher::prepare(
             addr,
             self.user.as_deref(),
@@ -113,34 +108,18 @@ impl ConnectionBuilder {
             self.connect_timeout,
             self.reconnect_interval.clone(),
             self.internal_simultaneous_requests_threshold,
-            features.clone(),
         )
         .await?;
 
         // TODO: support setting custom executor
         tokio::spawn(dispatcher_fut);
-        let conn = Connection::new(
+        Ok(Connection::new(
             dispatcher_sender,
             self.timeout,
             self.transaction_timeout,
             self.transaction_isolation_level,
             self.sql_statement_cache_capacity,
-            features,
-        );
-
-        // The IPROTO_ID handshake runs inside every transport connection, so
-        // the features are negotiated by the time `prepare` returns.
-        let negotiated = conn.features();
-        debug!(
-            "Negotiated features: VERSION - {}, STREAMS - {}, TRANSACTIONS - {}, ERROR_EXTENSION - {}, WATCHERS - {}",
-            negotiated.protocol_version,
-            negotiated.streams,
-            negotiated.transactions,
-            negotiated.error_extension,
-            negotiated.watchers
-        );
-
-        Ok(conn)
+        ))
     }
 
     /// Sets user login and, optionally, password, used for this connection.

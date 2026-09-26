@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use parking_lot::RwLock;
 use tokio::{
     net::ToSocketAddrs,
     sync::{mpsc, oneshot},
@@ -20,10 +19,7 @@ use tracing::{debug, error};
 use super::connection::Connection;
 use crate::{
     Error, ReconnectInterval,
-    codec::{
-        request::{ConnectionFeatures, EncodedRequest},
-        response::Response,
-    },
+    codec::{request::EncodedRequest, response::Response},
 };
 
 /// Request from the client together with the channel its response goes to.
@@ -163,7 +159,6 @@ impl Dispatcher {
         connect_timeout: Option<Duration>,
         reconnect_interval: Option<ReconnectInterval>,
         internal_simultaneous_requests_threshold: usize,
-        features: Arc<RwLock<ConnectionFeatures>>,
     ) -> Result<(impl Future<Output = ()> + use<A>, DispatcherSender), Error>
     where
         A: ToSocketAddrs + Display + Clone + Send + Sync + 'static,
@@ -175,7 +170,6 @@ impl Dispatcher {
             let user = user.clone();
             let password = password.clone();
             let connect_timeout = connect_timeout;
-            let features = features.clone();
             Box::pin(async move {
                 Connection::new(
                     addr,
@@ -183,7 +177,6 @@ impl Dispatcher {
                     password.as_deref(),
                     connect_timeout,
                     internal_simultaneous_requests_threshold,
-                    &features,
                 )
                 .await
             }) as Pin<Box<ConnectDynFuture>>
@@ -239,8 +232,7 @@ impl Dispatcher {
             };
             match attempt {
                 Ok(conn) => {
-                    // The handshake already refreshed the shared features;
-                    // bump before `run` lets requests onto the new connection.
+                    // Bump before `run` lets requests onto the new connection.
                     self.generation.fetch_add(1, Ordering::AcqRel);
                     self.conn = Some(conn);
                     return ReconnectOutcome::Connected;
@@ -358,25 +350,20 @@ impl From<&ReconnectInterval> for ReconnectIntervalState {
 mod tests {
     use super::*;
 
-    use parking_lot::RwLock;
     use tokio::net::TcpListener;
 
     use super::super::connection::tests::{echo_sync, spawn_fake_server};
-    use crate::codec::request::ConnectionFeatures;
 
     /// Dispatcher with no live connection whose factory connects to `addr`.
     fn dispatcher_for(
         addr: String,
         reconnect_interval: Option<ReconnectInterval>,
     ) -> (Dispatcher, DispatcherSender) {
-        let features = Arc::new(RwLock::new(ConnectionFeatures::default()));
         Dispatcher::new(
             Box::new(move || {
                 let addr = addr.clone();
-                let features = features.clone();
-                Box::pin(
-                    async move { Connection::new(addr, None, None, None, 16, &features).await },
-                ) as Pin<Box<ConnectDynFuture>>
+                Box::pin(async move { Connection::new(addr, None, None, None, 16).await })
+                    as Pin<Box<ConnectDynFuture>>
             }),
             None,
             reconnect_interval,

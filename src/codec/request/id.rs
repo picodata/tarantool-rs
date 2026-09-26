@@ -1,10 +1,8 @@
 use std::io::Write;
 
-use rmpv::Value;
-
 use crate::{
     codec::consts::{RequestType, keys},
-    errors::{DecodingError, EncodingError},
+    errors::EncodingError,
 };
 
 use super::{PROTOCOL_VERSION, Request};
@@ -71,95 +69,5 @@ impl Request for Id {
             rmp::encode::write_u8(&mut buf, Self::WATCHERS)?;
         }
         Ok(())
-    }
-}
-
-/// Protocol version and features the server reported in its `IPROTO_ID`
-/// response.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-// Mirrors the independent IPROTO_ID feature flags.
-#[allow(clippy::struct_excessive_bools)]
-pub(crate) struct ConnectionFeatures {
-    pub protocol_version: u64,
-    pub streams: bool,
-    pub transactions: bool,
-    pub error_extension: bool,
-    pub watchers: bool,
-}
-
-impl ConnectionFeatures {
-    /// Decode the body of an `IPROTO_ID` response,
-    /// `{VERSION: uint, FEATURES: [uint, ...]}`. Feature ids this crate does
-    /// not know are ignored.
-    pub(crate) fn decode(body: &Value) -> Result<Self, DecodingError> {
-        let Value::Map(entries) = body else {
-            return Err(DecodingError::type_mismatch("map", body.to_string()));
-        };
-        let mut features = Self::default();
-        for (key, value) in entries {
-            match key.as_u64() {
-                Some(k) if k == u64::from(keys::VERSION) => {
-                    features.protocol_version = value.as_u64().ok_or_else(|| {
-                        DecodingError::type_mismatch("unsigned integer", value.to_string())
-                            .in_key("VERSION")
-                    })?;
-                }
-                Some(k) if k == u64::from(keys::FEATURES) => {
-                    let Value::Array(ids) = value else {
-                        return Err(DecodingError::type_mismatch("array", value.to_string())
-                            .in_key("FEATURES"));
-                    };
-                    for id in ids {
-                        match id.as_u64() {
-                            Some(x) if x == u64::from(Id::STREAMS) => features.streams = true,
-                            Some(x) if x == u64::from(Id::TRANSACTIONS) => {
-                                features.transactions = true;
-                            }
-                            Some(x) if x == u64::from(Id::ERROR_EXTENSION) => {
-                                features.error_extension = true;
-                            }
-                            Some(x) if x == u64::from(Id::WATCHERS) => features.watchers = true,
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(features)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rmpv::Value;
-
-    use super::*;
-
-    #[test]
-    fn id_response_is_decoded_into_features() {
-        let body = Value::Map(vec![
-            (Value::from(keys::VERSION), Value::from(3u8)),
-            (
-                Value::from(keys::FEATURES),
-                // 99 is a feature id this crate does not know; it is ignored.
-                Value::Array(vec![
-                    Value::from(0u8),
-                    Value::from(1u8),
-                    Value::from(2u8),
-                    Value::from(99u8),
-                ]),
-            ),
-        ]);
-        assert_eq!(
-            ConnectionFeatures::decode(&body).unwrap(),
-            ConnectionFeatures {
-                protocol_version: 3,
-                streams: true,
-                transactions: true,
-                error_extension: true,
-                watchers: false,
-            }
-        );
     }
 }

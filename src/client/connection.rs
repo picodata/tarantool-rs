@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use lru::LruCache;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use rmpv::Value;
 use tokio::time::timeout;
 use tracing::{debug, trace};
@@ -21,7 +21,7 @@ use crate::{
     client::{Executor, Stream, Transaction, TransactionBuilder},
     codec::{
         consts::TransactionIsolationLevel,
-        request::{ConnectionFeatures, EncodedRequest, Request},
+        request::{EncodedRequest, Request},
         response::ResponseBody,
     },
     transport::DispatcherSender,
@@ -57,8 +57,6 @@ struct SqlStatementCache {
 
 struct ConnectionInner {
     dispatcher_sender: DispatcherSender,
-    /// Written by the transport after every `IPROTO_ID` handshake.
-    features: Arc<RwLock<ConnectionFeatures>>,
     // TODO: change how stream id assigned when dispatcher have more than one connection
     next_stream_id: AtomicU32,
     /// Sync of the next request, 64-bit as IPROTO carries it. The counter
@@ -88,12 +86,10 @@ impl Connection {
         transaction_timeout: Option<Duration>,
         transaction_isolation_level: TransactionIsolationLevel,
         sql_statement_cache_capacity: usize,
-        features: Arc<RwLock<ConnectionFeatures>>,
     ) -> Self {
         Self {
             inner: Arc::new(ConnectionInner {
                 dispatcher_sender,
-                features,
                 // TODO: check if 0 is valid value
                 next_stream_id: AtomicU32::new(1),
                 next_sync: AtomicU64::new(1),
@@ -179,11 +175,6 @@ impl Connection {
             ResponseBody::Ok(x) => Ok(x),
             ResponseBody::Error(x) => Err(x.into()),
         }
-    }
-
-    /// Features negotiated by the most recent `IPROTO_ID` handshake.
-    pub(crate) fn features(&self) -> ConnectionFeatures {
-        self.inner.features.read().clone()
     }
 
     /// Generation of the underlying transport connection.
@@ -333,7 +324,6 @@ mod tests {
             None,
             TransactionIsolationLevel::default(),
             10,
-            Arc::new(RwLock::new(ConnectionFeatures::default())),
         )
     }
 
