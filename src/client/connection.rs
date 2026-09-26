@@ -24,7 +24,7 @@ use crate::{
         request::{EncodedRequest, Request},
         response::ResponseBody,
     },
-    transport::DispatcherSender,
+    transport::{DispatcherSender, RequestSender},
 };
 
 /// Connection to Tarantool instance.
@@ -110,7 +110,13 @@ impl Connection {
         }
     }
 
-    /// Synchronously send request to channel and drop response.
+    /// Send a request from a background task and drop its response.
+    ///
+    /// The task holds only the dispatcher's request handle and the request
+    /// timeout, never a `Connection` and never the liveness receiver, so it
+    /// cannot keep the dispatcher alive: once the last client handle is gone,
+    /// the dispatcher closes the connection and the request gets
+    /// `ConnectionClosed`.
     #[allow(clippy::let_underscore_future)]
     pub(crate) fn send_request_sync_and_forget(
         &self,
@@ -118,11 +124,15 @@ impl Connection {
         stream_id: Option<u32>,
         generation: Option<u64>,
     ) {
-        let this = self.clone();
-        let req = EncodedRequest::new(body, stream_id);
+        let req = EncodedRequest::new(body, stream_id).map(|mut req| {
+            *req.sync_mut() = self.next_sync();
+            req
+        });
+        let requests = self.inner.dispatcher_sender.requests().clone();
+        let request_timeout = self.inner.timeout;
         let _ = self.inner.async_rt_handle.spawn(async move {
             let res = match req {
-                Ok(req) => this.send_with_generation(req, generation).await,
+                Ok(req) => send_with_timeout(&requests, req, generation, request_timeout).await,
                 Err(err) => Err(err.into()),
             };
             debug!("Response for background request: {:?}", res);
@@ -161,19 +171,13 @@ impl Connection {
         generation: Option<u64>,
     ) -> Result<Value> {
         *request.sync_mut() = self.next_sync();
-        let fut = self
-            .inner
-            .dispatcher_sender
-            .requests()
-            .send(request, generation);
-        let resp = match self.inner.timeout {
-            Some(x) => timeout(x, fut).await??,
-            None => fut.await?,
-        };
-        match resp.body {
-            ResponseBody::Ok(x) => Ok(x),
-            ResponseBody::Error(x) => Err(x.into()),
-        }
+        send_with_timeout(
+            self.inner.dispatcher_sender.requests(),
+            request,
+            generation,
+            self.inner.timeout,
+        )
+        .await
     }
 
     /// Generation of the underlying transport connection.
@@ -253,6 +257,25 @@ impl Connection {
         drop(update_lock);
 
         Some(stmt_id)
+    }
+}
+
+/// Queue `request` and wait for its response body, at most `request_timeout`.
+/// A timeout drops the request's future, which cancels the request.
+async fn send_with_timeout(
+    requests: &RequestSender,
+    request: EncodedRequest,
+    generation: Option<u64>,
+    request_timeout: Option<Duration>,
+) -> Result<Value> {
+    let fut = requests.send(request, generation);
+    let resp = match request_timeout {
+        Some(x) => timeout(x, fut).await??,
+        None => fut.await?,
+    };
+    match resp.body {
+        ResponseBody::Ok(x) => Ok(x),
+        ResponseBody::Error(x) => Err(x.into()),
     }
 }
 

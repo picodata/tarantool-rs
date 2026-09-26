@@ -546,27 +546,36 @@ mod tests {
     /// Fake server on one local address that can go down and come back.
     ///
     /// While up, it serves every connection: it sends the greeting, answers ID
-    /// with an ID body and every other request with an OK response. Going down
-    /// closes the live sockets; while down, it accepts each new connection
-    /// and closes it at once, counting it as a reconnect attempt.
+    /// with an ID body and every other request with an OK response, except the
+    /// request types in `silent`, which it never answers, and it records the
+    /// type of every request it reads. Going down closes the live sockets;
+    /// while down, it accepts each new connection and closes it at once,
+    /// counting it as a reconnect attempt.
     struct FlakyServer {
         addr: String,
         up: Arc<AtomicBool>,
         attempts_while_down: Arc<AtomicUsize>,
+        seen: Arc<Mutex<Vec<u8>>>,
         live: Arc<Mutex<Vec<JoinHandle<()>>>>,
     }
 
     impl FlakyServer {
         async fn start() -> Self {
+            Self::start_with_silent(&[]).await
+        }
+
+        async fn start_with_silent(silent: &'static [RequestType]) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let server = Self {
                 addr: listener.local_addr().unwrap().to_string(),
                 up: Arc::new(AtomicBool::new(true)),
                 attempts_while_down: Arc::default(),
+                seen: Arc::default(),
                 live: Arc::default(),
             };
             let up = server.up.clone();
             let attempts_while_down = server.attempts_while_down.clone();
+            let seen = server.seen.clone();
             let live = server.live.clone();
             tokio::spawn(async move {
                 while let Ok((mut sock, _)) = listener.accept().await {
@@ -575,11 +584,16 @@ mod tests {
                         drop(sock);
                         continue;
                     }
+                    let seen = seen.clone();
                     live.lock().push(tokio::spawn(async move {
                         if sock.write_all(&fake_greeting()).await.is_err() {
                             return;
                         }
                         while let Some((request_type, sync)) = read_request(&mut sock).await {
+                            seen.lock().push(request_type);
+                            if silent.iter().any(|x| *x as u8 == request_type) {
+                                continue;
+                            }
                             let response = ok_response(sync, &ok_body_for(request_type));
                             if sock.write_all(&response).await.is_err() {
                                 return;
@@ -601,6 +615,22 @@ mod tests {
 
         fn up(&self) {
             self.up.store(true, Ordering::SeqCst);
+        }
+
+        /// Types of the requests the server read, in order.
+        fn seen(&self) -> Vec<u8> {
+            self.seen.lock().clone()
+        }
+
+        /// Wait until the server read a request of `request_type`.
+        async fn wait_for_request(&self, request_type: RequestType) {
+            timeout(Duration::from_secs(2), async {
+                while !self.seen().contains(&(request_type as u8)) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no {request_type:?} within 2 s"));
         }
 
         /// Wait until the dispatcher tried to connect while the server was
@@ -696,6 +726,112 @@ mod tests {
         let transaction = transaction.await.unwrap().unwrap();
         transaction.ping().await.unwrap();
         transaction.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_dropped_during_the_outage_rolls_nothing_back() {
+        let server = FlakyServer::start().await;
+        let (conn, dispatcher) = connect(&server, None).await;
+        let transaction = conn.transaction().await.unwrap();
+        server.down();
+        server.wait_for_reconnect_attempt().await;
+
+        // Stale: the server discarded it with the lost session.
+        drop(transaction);
+        server.up();
+        timeout(Duration::from_secs(2), conn.ping())
+            .await
+            .expect("no reconnect within 2 s")
+            .unwrap();
+        // Give a stray ROLLBACK the time to reach the new session. It gets
+        // there only if both the drop's staleness check and the transport's
+        // generation check break.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let seen = server.seen();
+        assert!(!seen.contains(&(RequestType::Rollback as u8)), "{seen:?}");
+
+        drop(conn);
+        timeout(Duration::from_secs(2), dispatcher)
+            .await
+            .expect("the dispatcher outlived the last client handle")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatcher_exits_during_the_outage_after_a_committed_transaction() {
+        let server = FlakyServer::start().await;
+        let (conn, dispatcher) = connect(&server, None).await;
+        conn.transaction().await.unwrap().commit().await.unwrap();
+        server.down();
+        server.wait_for_reconnect_attempt().await;
+
+        drop(conn);
+
+        timeout(Duration::from_secs(2), dispatcher)
+            .await
+            .expect("the dispatcher outlived the last client handle")
+            .unwrap();
+    }
+
+    /// Begin a transaction during the outage and give up on it after 100 ms:
+    /// the transaction was already created, so its drop sends a ROLLBACK,
+    /// which waits in the queue while the server is down.
+    async fn cancel_a_begin_during_the_outage(conn: &crate::Connection) {
+        assert!(
+            timeout(Duration::from_millis(100), conn.transaction())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_cancelled_during_the_outage_does_not_keep_the_dispatcher_alive() {
+        let server = FlakyServer::start().await;
+        let (conn, dispatcher) = connect(&server, None).await;
+        server.down();
+        server.wait_for_reconnect_attempt().await;
+        cancel_a_begin_during_the_outage(&conn).await;
+
+        drop(conn);
+
+        timeout(Duration::from_secs(2), dispatcher)
+            .await
+            .expect("the drop-time rollback kept the dispatcher alive")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatcher_exits_at_once_with_a_request_timeout() {
+        let server = FlakyServer::start().await;
+        let (conn, dispatcher) = connect(&server, Some(Duration::from_millis(500))).await;
+        server.down();
+        server.wait_for_reconnect_attempt().await;
+        cancel_a_begin_during_the_outage(&conn).await;
+
+        drop(conn);
+
+        // Well before the ROLLBACK's 500 ms timeout would release it.
+        timeout(Duration::from_millis(250), dispatcher)
+            .await
+            .expect("the dispatcher waited for the ROLLBACK's timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unanswered_drop_rollback_does_not_keep_the_dispatcher_alive() {
+        let server = FlakyServer::start_with_silent(&[RequestType::Rollback]).await;
+        let (conn, dispatcher) = connect(&server, None).await;
+        let transaction = conn.transaction().await.unwrap();
+
+        // Connected: the ROLLBACK is sent, and the server never answers it.
+        drop(transaction);
+        server.wait_for_request(RequestType::Rollback).await;
+        drop(conn);
+
+        timeout(Duration::from_secs(2), dispatcher)
+            .await
+            .expect("the unanswered ROLLBACK kept the dispatcher alive")
+            .unwrap();
     }
 
     fn exp_backoff_state(
