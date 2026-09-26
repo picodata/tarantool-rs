@@ -9,8 +9,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use lru::LruCache;
-use parking_lot::Mutex;
 use rmpv::Value;
 use tokio::time::timeout;
 use tracing::{debug, trace};
@@ -18,7 +16,7 @@ use tracing::{debug, trace};
 use crate::{
     ExecutorExt, Result,
     builder::ConnectionBuilder,
-    client::{Executor, Stream, Transaction, TransactionBuilder},
+    client::{Executor, Stream, Transaction, TransactionBuilder, sql::SqlStatementCache},
     codec::{
         consts::TransactionIsolationLevel,
         request::{EncodedRequest, Request},
@@ -35,24 +33,18 @@ use crate::{
 /// Underling implemenation could reconnect automatically (depending on builder configuration),
 /// and could do pooling in the future (not yet implemented!).
 ///
-/// Automatic reconnect only ever affects plain, stateless requests sent
-/// directly through a `Connection`. A [`Stream`] or [`Transaction`] created
-/// from it does not survive a reconnect: its state lived only on the old
-/// server session, so a request made through it afterwards fails with
-/// [`Error::ConnectionReset`][crate::Error::ConnectionReset] instead of
-/// silently rebinding to the new connection.
+/// Plain requests go to whichever connection is current, so they survive a
+/// reconnect. A request that depends on server session state does not: a
+/// [`Stream`] or [`Transaction`] created before the connection was lost fails
+/// with [`Error::ConnectionReset`][crate::Error::ConnectionReset] instead of
+/// silently rebinding to the new connection, and a statement from
+/// [`ExecutorExt::prepare_sql`] fails with the server's error (see
+/// [`PreparedSqlStatement`][crate::PreparedSqlStatement]).
+/// [`ExecutorExt::execute_sql`] handles its own statement cache and needs
+/// nothing from the caller.
 #[derive(Clone)]
 pub struct Connection {
     inner: Arc<ConnectionInner>,
-}
-
-/// SQL statement cache together with the generation it was last touched
-/// under. Tarantool checks prepared-statement ids per session, so a
-/// reconnect (a new session) invalidates every id the cache holds; a
-/// generation mismatch on lookup is treated as a full cache miss.
-struct SqlStatementCache {
-    generation: u64,
-    cache: LruCache<String, u64>,
 }
 
 struct ConnectionInner {
@@ -67,10 +59,7 @@ struct ConnectionInner {
     transaction_timeout_secs: Option<f64>,
     transaction_isolation_level: TransactionIsolationLevel,
     async_rt_handle: tokio::runtime::Handle,
-    // TODO: tests
-    // TODO: move sql statement cache to separate type
-    sql_statement_cache: Option<Mutex<SqlStatementCache>>,
-    sql_statement_cache_update_lock: Mutex<()>,
+    sql_statement_cache: Option<SqlStatementCache>,
 }
 
 impl Connection {
@@ -99,13 +88,8 @@ impl Connection {
                 // NOTE: Safety: this method can be called only in async tokio context (because it
                 // is called only from ConnectionBuilder).
                 async_rt_handle: tokio::runtime::Handle::current(),
-                sql_statement_cache: NonZeroUsize::new(sql_statement_cache_capacity).map(|x| {
-                    Mutex::new(SqlStatementCache {
-                        generation: 0,
-                        cache: LruCache::new(x),
-                    })
-                }),
-                sql_statement_cache_update_lock: Mutex::new(()),
+                sql_statement_cache: NonZeroUsize::new(sql_statement_cache_capacity)
+                    .map(SqlStatementCache::new),
             }),
         }
     }
@@ -211,52 +195,36 @@ impl Connection {
     /// Only one statement can be prepared at the time. All other will immediately
     /// return None, when there is already a statement being prepared. Eventually
     /// all statements should be allowed to prepare.
-    // Update lock is only taken with `try_lock`, so holding it across `await`
-    // never blocks other tasks.
+    // The prepare lock is only taken with `try_lock`, so holding it across
+    // `await` never blocks other tasks.
     #[allow(clippy::await_holding_lock)]
     async fn get_cached_sql_statement_id_inner(&self, statement: &str) -> Option<u64> {
-        // Lock cache mutex (if cache is not None) and check if statement is
-        // present in cache. Tarantool checks prepared-statement ids per
-        // session, so a reconnect since the cache was last touched means
-        // every id it holds is stale; drop the whole cache instead of
-        // trusting it, and treat this lookup as a miss.
         let cache = self.inner.sql_statement_cache.as_ref()?;
-        let current_generation = self.generation();
-        if let Some(stmt_id) = {
-            let mut guard = cache.lock();
-            if guard.generation == current_generation {
-                guard.cache.get(statement).copied()
-            } else {
-                guard.generation = current_generation;
-                guard.cache.clear();
-                None
-            }
-        } {
+        let generation = self.generation();
+        if let Some(stmt_id) = cache.get(statement, generation) {
             return Some(stmt_id);
         }
 
-        // If statement not found, try to lock update lock mutex.
-        // If successful, proceed with preparing SQL statement,
-        // otherwise return None.
-        let update_lock = self.inner.sql_statement_cache_update_lock.try_lock()?;
-        let stmt_id = {
-            let stmt_id = match self.prepare_sql(statement).await {
-                Ok(x) => {
-                    let stmt_id = x.stmt_id();
-                    trace!(statement, "Statement prepared with id {stmt_id}");
-                    stmt_id
-                }
-                Err(err) => {
-                    debug!("Failed to prepare statement for cache: {:#}", err);
-                    return None;
-                }
-            };
-            let _ = cache.lock().cache.put(statement.into(), stmt_id);
-            stmt_id
+        // Only one statement is prepared at a time; the other callers send
+        // their text.
+        let _preparing = cache.preparing.try_lock()?;
+        let stmt_id = match self.prepare_sql(statement).await {
+            Ok(x) => {
+                let stmt_id = x.stmt_id();
+                trace!(statement, "Statement prepared with id {stmt_id}");
+                stmt_id
+            }
+            Err(err) => {
+                debug!("Failed to prepare statement for cache: {:#}", err);
+                return None;
+            }
         };
-        drop(update_lock);
-
-        Some(stmt_id)
+        // The id belongs to the session the PREPARE ran on. If the connection
+        // was lost meanwhile, the id is useless: send the text instead.
+        if self.generation() != generation {
+            return None;
+        }
+        cache.put(statement, stmt_id, generation).then_some(stmt_id)
     }
 }
 
@@ -300,6 +268,12 @@ impl Executor for Connection {
     async fn get_cached_sql_statement_id(&self, statement: &str) -> Option<u64> {
         self.get_cached_sql_statement_id_inner(statement).await
     }
+
+    fn evict_cached_sql_statement(&self, statement: &str, stmt_id: u64) {
+        if let Some(cache) = &self.inner.sql_statement_cache {
+            cache.evict(statement, stmt_id);
+        }
+    }
 }
 
 impl fmt::Debug for Connection {
@@ -310,11 +284,18 @@ impl fmt::Debug for Connection {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::pin,
+        task::{Context, Waker},
+    };
+
+    use parking_lot::Mutex;
     use tokio::sync::mpsc;
 
     use super::*;
     use crate::{
         codec::consts::RequestType,
+        codec::consts::error_codes::{ER_SQL_EXECUTE, ER_WRONG_QUERY_ID},
         codec::response::Response,
         errors::{Error, ErrorResponse, TransactionError},
         transport::ClientRequest,
@@ -350,17 +331,66 @@ mod tests {
         ResponseBody::Ok(Value::Map(Vec::new()))
     }
 
+    /// OK body of a PREPARE reply with statement id `id`.
+    fn stmt_id_body(id: u64) -> ResponseBody {
+        ResponseBody::Ok(Value::Map(vec![(
+            Value::from(crate::codec::consts::keys::SQL_STMT_ID),
+            Value::from(id),
+        )]))
+    }
+
     /// Answers every request OK; a `Prepare` request gets a fixed
     /// `SQL_STMT_ID` so the response decodes into a prepared statement.
     fn prepare_ok_body(request_type: u8) -> ResponseBody {
         if request_type == RequestType::Prepare as u8 {
-            ResponseBody::Ok(Value::Map(vec![(
-                Value::from(crate::codec::consts::keys::SQL_STMT_ID),
-                Value::from(42u64),
-            )]))
+            stmt_id_body(42)
         } else {
             ok_body(request_type)
         }
+    }
+
+    /// Reply for the eviction tests: PREPARE gets id 42, the `failing`th
+    /// EXECUTE gets Tarantool error `code`, everything else is OK.
+    fn fail_nth_execute(failing: usize, code: u32) -> impl FnMut(u8) -> ResponseBody + Send {
+        let mut executes = 0;
+        move |request_type| {
+            if request_type == RequestType::Execute as u8 {
+                executes += 1;
+                if executes == failing {
+                    return ResponseBody::Error(ErrorResponse::new(code, "rejected".into(), None));
+                }
+            }
+            prepare_ok_body(request_type)
+        }
+    }
+
+    /// The PREPARE and EXECUTE requests the fake dispatcher saw, in order.
+    fn sql_requests(seen: &Mutex<Vec<Seen>>) -> Vec<&'static str> {
+        seen.lock()
+            .iter()
+            .filter_map(|&(request_type, ..)| {
+                if request_type == RequestType::Prepare as u8 {
+                    Some("PREPARE")
+                } else if request_type == RequestType::Execute as u8 {
+                    Some("EXECUTE")
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Answer `request`, a PREPARE, with statement id `id`.
+    fn answer_prepare(request: ClientRequest, id: u64) {
+        assert_eq!(
+            request.request.request_type as u8,
+            RequestType::Prepare as u8
+        );
+        let _ = request.responder.send(Ok(Response {
+            sync: request.request.sync,
+            schema_version: 1,
+            body: stmt_id_body(id),
+        }));
     }
 
     fn reject_commit_and_rollback(request_type: u8) -> ResponseBody {
@@ -758,14 +788,20 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let conn = test_connection(tx, Arc::default(), None);
 
-        let update_lock = conn.inner.sql_statement_cache_update_lock.lock();
+        let preparing = conn
+            .inner
+            .sql_statement_cache
+            .as_ref()
+            .unwrap()
+            .preparing
+            .lock();
         let res = timeout(
             Duration::from_secs(1),
             conn.get_cached_sql_statement_id_inner("SELECT 1"),
         )
         .await
         .expect("did not return immediately while another statement is being prepared");
-        drop(update_lock);
+        drop(preparing);
 
         assert_eq!(res, None);
         assert!(rx.try_recv().is_err(), "PREPARE request was sent");
@@ -853,6 +889,169 @@ mod tests {
             .await
             .expect("statement is re-prepared after a reconnect");
         assert_eq!(prepares(), 2, "cached statement id survived a reconnect");
+    }
+
+    /// Poll a lookup of "SELECT 1" once and check that it sent a PREPARE and
+    /// waits for the reply. A lookup that returns at once fails the check
+    /// with `reason`, which says what went wrong.
+    fn assert_next_lookup_prepares(
+        conn: &Connection,
+        rx: &mut mpsc::Receiver<ClientRequest>,
+        reason: &str,
+    ) {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut lookup = pin!(conn.get_cached_sql_statement_id_inner("SELECT 1"));
+        let poll = lookup.as_mut().poll(&mut cx);
+        assert!(poll.is_pending(), "{reason}: the lookup returned {poll:?}");
+        let request = rx.try_recv().expect("the pending lookup sent nothing");
+        assert_eq!(
+            request.request.request_type as u8,
+            RequestType::Prepare as u8
+        );
+    }
+
+    /// V03: lookup A sends PREPARE at generation 0, and the connection is
+    /// lost before A resumes. With `concurrent_lookup`, task B looks up
+    /// another text in between and relabels the cache (the persistent form);
+    /// without it, A resumes first (the one-shot variant).
+    async fn assert_id_prepared_on_a_lost_session_is_not_used(concurrent_lookup: bool) {
+        let (tx, mut rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let conn = test_connection(tx, generation.clone(), None);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // Task A looks up "SELECT 1" at generation 0 and sends PREPARE; the
+        // old session answers 42, which wakes A without polling it.
+        let mut a = pin!(conn.get_cached_sql_statement_id_inner("SELECT 1"));
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+        answer_prepare(rx.try_recv().unwrap(), 42);
+        // The connection is lost.
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        if concurrent_lookup {
+            // Task B relabels the cache, finds the prepare lock taken and
+            // sends nothing.
+            assert_eq!(
+                conn.get_cached_sql_statement_id_inner("SELECT 2").await,
+                None
+            );
+            assert!(rx.try_recv().is_err());
+        }
+
+        // A neither returns nor caches the id of the lost session.
+        assert_eq!(a.await, None);
+        assert_next_lookup_prepares(&conn, &mut rx, "the stale id 42 was served");
+    }
+
+    #[tokio::test]
+    async fn id_prepared_on_a_lost_session_is_not_cached() {
+        assert_id_prepared_on_a_lost_session_is_not_used(true).await;
+    }
+
+    #[tokio::test]
+    async fn id_prepared_on_a_lost_session_is_not_returned() {
+        assert_id_prepared_on_a_lost_session_is_not_used(false).await;
+    }
+
+    /// Three `execute_sql` calls of one text, the second EXECUTE rejected
+    /// with `code`: the second call returns that error after a single
+    /// EXECUTE, and the third prepares the statement again.
+    async fn assert_rejected_statement_is_evicted_without_a_retry(code: u32) {
+        let (tx, rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+        let seen = spawn_fake_dispatcher(rx, fail_nth_execute(2, code));
+
+        conn.execute_sql("SELECT 1", ()).await.unwrap();
+        let res = conn.execute_sql("SELECT 1", ()).await;
+        assert!(
+            matches!(res, Err(Error::Response(ref err)) if err.code == code),
+            "{res:?}"
+        );
+        conn.execute_sql("SELECT 1", ()).await.unwrap();
+
+        assert_eq!(
+            sql_requests(&seen),
+            ["PREPARE", "EXECUTE", "EXECUTE", "PREPARE", "EXECUTE"]
+        );
+    }
+
+    #[tokio::test]
+    async fn statement_rejected_with_sql_execute_is_evicted_without_a_retry() {
+        assert_rejected_statement_is_evicted_without_a_retry(ER_SQL_EXECUTE).await;
+    }
+
+    #[tokio::test]
+    async fn statement_rejected_with_wrong_query_id_is_evicted_without_a_retry() {
+        assert_rejected_statement_is_evicted_without_a_retry(ER_WRONG_QUERY_ID).await;
+    }
+
+    #[tokio::test]
+    async fn unrelated_server_error_keeps_the_cached_statement() {
+        // 3 is ER_TUPLE_FOUND.
+        let (tx, rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+        let seen = spawn_fake_dispatcher(rx, fail_nth_execute(2, 3));
+
+        conn.execute_sql("SELECT 1", ()).await.unwrap();
+        assert!(conn.execute_sql("SELECT 1", ()).await.is_err());
+        conn.execute_sql("SELECT 1", ()).await.unwrap();
+
+        assert_eq!(
+            sql_requests(&seen),
+            ["PREPARE", "EXECUTE", "EXECUTE", "EXECUTE"]
+        );
+    }
+
+    #[tokio::test]
+    async fn statement_evicted_through_a_stream_leaves_the_connection_cache() {
+        let (tx, rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+        let seen = spawn_fake_dispatcher(rx, fail_nth_execute(2, ER_SQL_EXECUTE));
+        let stream = conn.stream();
+
+        conn.execute_sql("SELECT 1", ()).await.unwrap();
+        assert!(stream.execute_sql("SELECT 1", ()).await.is_err());
+        conn.execute_sql("SELECT 1", ()).await.unwrap();
+
+        assert_eq!(
+            sql_requests(&seen),
+            ["PREPARE", "EXECUTE", "EXECUTE", "PREPARE", "EXECUTE"]
+        );
+    }
+
+    #[tokio::test]
+    async fn statement_prepared_on_a_stream_fails_with_connection_reset_after_the_loss() {
+        let (tx, rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let conn = test_connection(tx, generation.clone(), None);
+        let seen = spawn_fake_dispatcher(rx, prepare_ok_body);
+        let stream = conn.stream();
+        let statement = stream.prepare_sql("SELECT ?").await.unwrap();
+
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        let res = statement.execute((1,)).await;
+        assert!(matches!(res, Err(Error::ConnectionReset)), "{res:?}");
+        assert_eq!(sql_requests(&seen), ["PREPARE"]);
+    }
+
+    #[tokio::test]
+    async fn lookup_dropped_while_preparing_releases_the_prepare_lock() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        {
+            // A caller's timeout drops the lookup while its PREPARE is in
+            // flight.
+            let mut lookup = pin!(conn.get_cached_sql_statement_id_inner("SELECT 1"));
+            assert!(lookup.as_mut().poll(&mut cx).is_pending());
+        }
+        let abandoned = rx.try_recv().expect("the first lookup sent PREPARE");
+        drop(abandoned);
+
+        // The next lookup prepares again instead of sending the text.
+        assert_next_lookup_prepares(&conn, &mut rx, "the prepare lock stayed taken");
     }
 
     #[tokio::test]

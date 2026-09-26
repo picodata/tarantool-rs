@@ -32,6 +32,11 @@ pub trait Executor: Sealed + Send + Sync + Debug {
     async fn transaction(&self) -> Result<Transaction>;
 
     async fn get_cached_sql_statement_id(&self, statement: &str) -> Option<u64>;
+
+    /// Forget the cached id `stmt_id` of `statement` after the server rejected
+    /// it. Used by [`ExecutorExt::execute_sql`][crate::ExecutorExt::execute_sql].
+    #[doc(hidden)]
+    fn evict_cached_sql_statement(&self, statement: &str, stmt_id: u64);
 }
 
 #[async_trait]
@@ -55,6 +60,10 @@ impl<E: Executor + Sealed + Sync + Debug> Executor for &E {
     async fn get_cached_sql_statement_id(&self, statement: &str) -> Option<u64> {
         (**self).get_cached_sql_statement_id(statement).await
     }
+
+    fn evict_cached_sql_statement(&self, statement: &str, stmt_id: u64) {
+        (**self).evict_cached_sql_statement(statement, stmt_id);
+    }
 }
 
 #[async_trait]
@@ -77,6 +86,10 @@ impl<E: Executor + Sealed + Sync + Debug> Executor for &mut E {
 
     async fn get_cached_sql_statement_id(&self, statement: &str) -> Option<u64> {
         (**self).get_cached_sql_statement_id(statement).await
+    }
+
+    fn evict_cached_sql_statement(&self, statement: &str, stmt_id: u64) {
+        (**self).evict_cached_sql_statement(statement, stmt_id);
     }
 }
 

@@ -4,10 +4,14 @@ use rmpv::Value;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    CallResponse, DmoResponse, Executor, IteratorType, PreparedSqlStatement, Result, SqlResponse,
-    codec::request::{
-        Call, Delete, EncodedRequest, Eval, Execute, Insert, Ping, Prepare, Replace, Request,
-        Select, Update, Upsert,
+    CallResponse, DmoResponse, Error, Executor, IteratorType, PreparedSqlStatement, Result,
+    SqlResponse,
+    codec::{
+        consts::error_codes::{ER_SQL_EXECUTE, ER_WRONG_QUERY_ID},
+        request::{
+            Call, Delete, EncodedRequest, Eval, Execute, Insert, Ping, Prepare, Replace, Request,
+            Select, Update, Upsert,
+        },
     },
     schema::{SchemaEntityKey, Space},
     tuple::Tuple,
@@ -145,24 +149,44 @@ pub trait ExecutorExt: Executor {
     }
 
     // TODO: options
-    // TODO: tests for SQL
     /// Perform SQL query.
+    ///
+    /// Statements are prepared and cached per connection, unless the cache is
+    /// disabled, and a cached statement is sent by its id. While another
+    /// statement is being prepared, a call sends its text instead. After DDL,
+    /// one call may fail with `ER_SQL_EXECUTE` (159); after a reconnect, one
+    /// call may fail with `ER_WRONG_QUERY_ID` (211). The failing call evicts
+    /// the cached id and the next call prepares the statement again; the call
+    /// itself is not retried.
     async fn execute_sql<T, I>(&self, query: I, binds: T) -> Result<SqlResponse>
     where
         T: Tuple + Send,
         I: AsRef<str> + Send + Sync,
     {
         let query = query.as_ref();
-        let request = if let Some(stmt_id) = self.get_cached_sql_statement_id(query).await {
-            Execute::new_statement_id(stmt_id, binds)
-        } else {
-            Execute::new_query(query, binds)
+        let Some(stmt_id) = self.get_cached_sql_statement_id(query).await else {
+            return Ok(SqlResponse(
+                self.send_request(Execute::new_query(query, binds)).await?,
+            ));
         };
-        Ok(SqlResponse(self.send_request(request).await?))
+        let res = self
+            .send_request(Execute::new_statement_id(stmt_id, binds))
+            .await;
+        // By code alone: 159 also covers "schema version has changed", and a
+        // reworded message must not bring back an id that fails for good.
+        if let Err(Error::Response(err)) = &res
+            && (err.code == ER_SQL_EXECUTE || err.code == ER_WRONG_QUERY_ID)
+        {
+            self.evict_cached_sql_statement(query, stmt_id);
+        }
+        Ok(SqlResponse(res?))
     }
 
     // TODO: add caching in case of user incorrectly uses prepared statements
     /// Prepare SQL statement.
+    ///
+    /// The statement is bound to the server session it was prepared on; see
+    /// [`PreparedSqlStatement`] for what happens after a reconnect.
     async fn prepare_sql<I>(&self, query: I) -> Result<PreparedSqlStatement<&Self>>
     where
         I: AsRef<str> + Send + Sync,

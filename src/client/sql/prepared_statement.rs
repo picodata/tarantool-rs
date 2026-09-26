@@ -9,6 +9,13 @@ use crate::{
     utils::{find_and_take_single_key_in_map, value_to_map},
 };
 
+/// SQL statement prepared on the server by [`ExecutorExt::prepare_sql`].
+///
+/// The statement is bound to the server session it was prepared on. After a
+/// reconnect, `execute` on a statement from a plain `Connection` fails with
+/// `Error::Response`, code 211 (`ER_WRONG_QUERY_ID`): prepare it again. A
+/// statement from a `Stream` or `Transaction` fails with
+/// [`Error::ConnectionReset`][crate::Error::ConnectionReset] instead.
 #[derive(Debug)]
 pub struct PreparedSqlStatement<E> {
     stmt_id: u64,
@@ -50,6 +57,9 @@ impl<E: Clone> Clone for PreparedSqlStatement<E> {
 
 impl<E: Executor> PreparedSqlStatement<E> {
     /// Execute prepared SQL query with parameters.
+    ///
+    /// After a reconnect it fails: the statement is bound to the session it
+    /// was prepared on (see [`PreparedSqlStatement`]).
     /// # Errors
     ///
     /// Returns an error if the request failed to reach Tarantool or

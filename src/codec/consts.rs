@@ -78,6 +78,18 @@ pub mod response_codes {
     pub const ERROR_RANGE_END: u32 = 0x8FFF;
 }
 
+/// Tarantool error codes this crate reacts to.
+///
+/// See details [here](https://github.com/tarantool/tarantool/blob/master/src/box/errcode.h).
+pub mod error_codes {
+    /// The prepared statement cannot run, for example "statement has
+    /// expired" after DDL.
+    pub const ER_SQL_EXECUTE: u32 = 159;
+    /// The session knows no prepared statement with this id, for example
+    /// after a reconnect.
+    pub const ER_WRONG_QUERY_ID: u32 = 211;
+}
+
 /// Transaction isolation level.
 ///
 /// See docs [here](https://www.tarantool.io/en/doc/latest/concepts/atomic/txn_mode_mvcc/#txn-mode-mvcc-options).

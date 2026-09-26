@@ -107,6 +107,10 @@ impl Executor for Stream {
     async fn get_cached_sql_statement_id(&self, statement: &str) -> Option<u64> {
         self.conn.get_cached_sql_statement_id(statement).await
     }
+
+    fn evict_cached_sql_statement(&self, statement: &str, stmt_id: u64) {
+        self.conn.evict_cached_sql_statement(statement, stmt_id);
+    }
 }
 
 impl fmt::Debug for Stream {

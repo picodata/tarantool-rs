@@ -367,6 +367,81 @@ async fn transaction_created_during_outage_commits_after_reconnect() -> Result<(
 
 #[tokio::test]
 #[traced_test]
+async fn execute_sql_after_ddl_fails_once_then_recovers() -> Result<(), anyhow::Error> {
+    let container = TarantoolTestContainer::new_with_test_data();
+    let conn = container.create_conn().await?;
+
+    // Caches the statement.
+    let _ = conn.execute_sql("SELECT ?", (1,)).await?;
+    // DDL changes the schema version, which expires every prepared statement.
+    let _ = conn
+        .eval("box.schema.space.create('ddl_bump'):drop()", ())
+        .await?;
+
+    let err = conn
+        .execute_sql("SELECT ?", (1,))
+        .await
+        .expect_err("the expired statement ran");
+    assert_matches!(err, Error::Response(ref response) if response.code == 159);
+    // The failing call evicted the id: the next one prepares again.
+    let _ = conn.execute_sql("SELECT ?", (1,)).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn prepared_statement_after_restart_returns_wrong_query_id() -> Result<(), anyhow::Error> {
+    let container = TarantoolTestContainer::new_restartable();
+    let conn = Connection::builder()
+        .timeout(Duration::from_secs(5))
+        .build(format!("127.0.0.1:{}", container.connect_port()))
+        .await?;
+    let statement = conn.prepare_sql("SELECT ?").await?;
+    let _ = statement.execute((1,)).await?;
+
+    container.restart();
+    wait_until_reconnected(&conn, Duration::from_secs(60)).await;
+
+    // The new session does not know the id.
+    let err = statement
+        .execute((1,))
+        .await
+        .expect_err("the statement of the lost session ran");
+    assert_matches!(err, Error::Response(ref response) if response.code == 211);
+    // Prepared again, it runs.
+    let statement = conn.prepare_sql("SELECT ?").await?;
+    let _ = statement.execute((1,)).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn cached_sql_during_outage_uses_the_new_session() -> Result<(), anyhow::Error> {
+    let container = TarantoolTestContainer::new_restartable();
+    // Long enough for the PREPARE to wait out the restart in the queue.
+    let conn = Connection::builder()
+        .timeout(Duration::from_secs(30))
+        .build(format!("127.0.0.1:{}", container.connect_port()))
+        .await?;
+    // Cached on the first session.
+    let _ = conn.execute_sql("SELECT ?", (1,)).await?;
+    let probe = conn.stream();
+    probe.ping().await?;
+
+    container.restart();
+    wait_until_reset(&probe, Duration::from_secs(60)).await;
+
+    // The loss was observed, so the lookup misses and prepares on the new
+    // session instead of sending the old id.
+    let _ = conn.execute_sql("SELECT ?", (1,)).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
 async fn upsert_on_existing_tuple_applies_operations() -> Result<(), anyhow::Error> {
     let container = TarantoolTestContainer::new_with_test_data();
     let conn = container.create_conn().await?;
