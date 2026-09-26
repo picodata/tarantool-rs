@@ -92,8 +92,9 @@ pub trait Request {
 pub struct EncodedRequest {
     pub(crate) request_type: RequestType,
     /// By default `sync` is set to 0 and replaced with the client-assigned
-    /// value by [`crate::Connection`] before the request is sent.
-    pub(crate) sync: u32,
+    /// value by [`crate::Connection`] before the request is sent. IPROTO
+    /// syncs are 64-bit on the wire.
+    pub(crate) sync: u64,
     pub(crate) schema_version: Option<u32>,
     pub(crate) stream_id: Option<u32>,
     pub(crate) encoded_body: Bytes,
@@ -123,7 +124,8 @@ impl EncodedRequest {
         rmp::encode::write_pfix(&mut buf, keys::REQUEST_TYPE)?;
         rmp::encode::write_u8(&mut buf, self.request_type as u8)?;
         rmp::encode::write_pfix(&mut buf, keys::SYNC)?;
-        rmp::encode::write_u32(&mut buf, self.sync)?;
+        // The smallest encoding that fits, so small syncs stay compact.
+        rmp::encode::write_uint(&mut buf, self.sync)?;
         if let Some(x) = self.schema_version {
             rmp::encode::write_pfix(&mut buf, keys::SCHEMA_VERSION)?;
             rmp::encode::write_u32(&mut buf, x)?;
@@ -137,7 +139,7 @@ impl EncodedRequest {
             .map_err(EncodingError::MessagePack)
     }
 
-    pub(crate) fn sync_mut(&mut self) -> &mut u32 {
+    pub(crate) fn sync_mut(&mut self) -> &mut u64 {
         &mut self.sync
     }
 }

@@ -3,7 +3,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -61,10 +61,10 @@ struct ConnectionInner {
     features: Arc<RwLock<ConnectionFeatures>>,
     // TODO: change how stream id assigned when dispatcher have more than one connection
     next_stream_id: AtomicU32,
-    /// Sync of the next request. IPROTO only needs syncs to be unique among
-    /// requests in flight on one TCP connection, which a single wrapping
-    /// counter shared by all generations satisfies.
-    next_sync: AtomicU32,
+    /// Sync of the next request, 64-bit as IPROTO carries it. The counter
+    /// never wraps in practice, so a sync is never handed to a new request
+    /// while an older request with the same sync may still run on the server.
+    next_sync: AtomicU64,
     timeout: Option<Duration>,
     transaction_timeout_secs: Option<f64>,
     transaction_isolation_level: TransactionIsolationLevel,
@@ -96,7 +96,7 @@ impl Connection {
                 features,
                 // TODO: check if 0 is valid value
                 next_stream_id: AtomicU32::new(1),
-                next_sync: AtomicU32::new(1),
+                next_sync: AtomicU64::new(1),
                 timeout,
                 transaction_timeout_secs: transaction_timeout.as_ref().map(Duration::as_secs_f64),
                 transaction_isolation_level,
@@ -144,8 +144,7 @@ impl Connection {
     }
 
     /// Allocate the sync for the next request.
-    pub(crate) fn next_sync(&self) -> u32 {
-        // `fetch_add` on atomics wraps around on overflow.
+    pub(crate) fn next_sync(&self) -> u64 {
         self.inner.next_sync.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -313,8 +312,6 @@ impl fmt::Debug for Connection {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU64;
-
     use tokio::sync::mpsc;
 
     use super::*;
@@ -470,12 +467,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_sync_wraps_around() {
+    async fn next_sync_is_64_bit() {
         let (tx, _rx) = mpsc::channel(1);
         let conn = test_connection(tx, Arc::default(), None);
-        conn.inner.next_sync.store(u32::MAX, Ordering::Relaxed);
-        assert_eq!(conn.next_sync(), u32::MAX);
-        assert_eq!(conn.next_sync(), 0);
+        conn.inner
+            .next_sync
+            .store(u64::from(u32::MAX), Ordering::Relaxed);
+        assert_eq!(conn.next_sync(), u64::from(u32::MAX));
+        // Past u32::MAX the counter keeps counting instead of wrapping to 0.
+        assert_eq!(conn.next_sync(), u64::from(u32::MAX) + 1);
     }
 
     #[tokio::test]
@@ -511,7 +511,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let conn = test_connection(tx.clone(), Arc::default(), Some(Duration::from_millis(50)));
         // Fill the queue so neither the request nor its cancel fits.
-        assert!(tx.try_send(DispatcherMessage::Cancel(u32::MAX)).is_ok());
+        assert!(tx.try_send(DispatcherMessage::Cancel(u64::MAX)).is_ok());
 
         let res = timeout(Duration::from_secs(1), conn.ping())
             .await
@@ -520,7 +520,7 @@ mod tests {
         assert!(matches!(res, Err(Error::Timeout)), "{res:?}");
         assert!(matches!(
             rx.try_recv(),
-            Ok(DispatcherMessage::Cancel(u32::MAX))
+            Ok(DispatcherMessage::Cancel(u64::MAX))
         ));
         assert!(rx.try_recv().is_err(), "a message was queued past capacity");
     }

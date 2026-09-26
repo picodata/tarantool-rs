@@ -42,37 +42,20 @@ pub(crate) enum DispatcherMessage {
     /// Send the request and route its response back.
     Request(ClientRequest),
     /// The caller gave up on the request with this sync; forget it.
-    Cancel(u32),
+    Cancel(u64),
 }
 
-pub(crate) enum DispatcherResponse {
-    Finished(Result<Response, Error>),
-}
-
-impl From<Result<Response, Error>> for DispatcherResponse {
-    #[inline]
-    fn from(value: Result<Response, Error>) -> Self {
-        Self::Finished(value)
-    }
-}
-
-impl From<Error> for DispatcherResponse {
-    #[inline]
-    fn from(value: Error) -> Self {
-        Self::Finished(Err(value))
-    }
-}
-
+/// Channel the response to one request, or its error, goes to.
 #[repr(transparent)]
-pub(crate) struct DispatcherResponseSender(pub(super) oneshot::Sender<DispatcherResponse>);
+pub(crate) struct DispatcherResponseSender(pub(super) oneshot::Sender<Result<Response, Error>>);
 
 impl DispatcherResponseSender {
     #[inline]
     pub(crate) fn send(
         self,
-        value: impl Into<DispatcherResponse>,
-    ) -> Result<(), DispatcherResponse> {
-        self.0.send(value.into())
+        value: Result<Response, Error>,
+    ) -> Result<(), Result<Response, Error>> {
+        self.0.send(value)
     }
 
     #[inline]
@@ -127,10 +110,7 @@ impl DispatcherSender {
         {
             return Err(Error::ConnectionClosed);
         }
-        match rx.await {
-            Ok(DispatcherResponse::Finished(x)) => x,
-            Err(_) => Err(Error::ConnectionClosed),
-        }
+        rx.await.unwrap_or(Err(Error::ConnectionClosed))
     }
 
     /// Tell the dispatcher that nobody awaits the response for `sync` any more.
@@ -138,7 +118,7 @@ impl DispatcherSender {
     /// Best-effort: if the channel is full or closed the message is dropped,
     /// and the entry lives until its response arrives or the connection is
     /// recycled.
-    pub(crate) fn cancel(&self, sync: u32) {
+    pub(crate) fn cancel(&self, sync: u64) {
         if let Err(err) = self.tx.try_send(DispatcherMessage::Cancel(sync)) {
             debug!("Failed to cancel sync {sync}: {err}");
         }

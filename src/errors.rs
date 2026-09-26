@@ -58,9 +58,10 @@ pub enum Error {
     #[error(transparent)]
     Decode(#[from] DecodingError),
 
-    /// Duplicated sync detected.
+    /// Duplicated sync detected. The payload is the 64-bit sync of the
+    /// rejected request, as IPROTO carries it on the wire.
     #[error("Duplicated sync '{0}'")]
-    DuplicatedSync(u32),
+    DuplicatedSync(u64),
 
     /// Space is missing primary index (with 0 id).
     #[error("Space is missing primary index")]

@@ -28,9 +28,7 @@ use tokio_util::{
 };
 use tracing::{debug, error, trace, warn};
 
-use super::dispatcher::{
-    ClientRequest, DispatcherMessage, DispatcherResponse, DispatcherResponseSender,
-};
+use super::dispatcher::{ClientRequest, DispatcherMessage, DispatcherResponseSender};
 use crate::{
     codec::{
         ClientCodec, Greeting,
@@ -43,10 +41,10 @@ use crate::{
 /// Sync of the AUTH and ID handshake requests. Nothing else is in flight
 /// during the handshake and both responses are read synchronously, so it
 /// cannot collide with the client-assigned syncs used afterwards.
-const HANDSHAKE_SYNC: u32 = 0;
+const HANDSHAKE_SYNC: u64 = 0;
 
 struct ConnectionData {
-    in_flights: HashMap<u32, DispatcherResponseSender>,
+    in_flights: HashMap<u64, DispatcherResponseSender>,
 }
 
 impl Default for ConnectionData {
@@ -85,7 +83,7 @@ impl ConnectionData {
                 "Rejecting request with sync {} from generation {}, connection is at {}",
                 request.sync, captured, current_generation
             );
-            if tx.send(Error::ConnectionReset).is_err() {
+            if tx.send(Err(Error::ConnectionReset)).is_err() {
                 debug!(
                     "Failed to pass ConnectionReset to sync {}, receiver dropped",
                     request.sync
@@ -106,7 +104,7 @@ impl ConnectionData {
                 .in_flights
                 .insert(request.sync, old)
                 .expect("Shouldn't panic, value was just inserted");
-            if new.send(Error::DuplicatedSync(request.sync)).is_err() {
+            if new.send(Err(Error::DuplicatedSync(request.sync))).is_err() {
                 warn!(
                     "Failed to pass error to sync {}, receiver dropped",
                     request.sync
@@ -120,7 +118,7 @@ impl ConnectionData {
     /// Forget the request with `sync`: its caller timed out and dropped the
     /// receiver. A response arriving later is logged as unknown and dropped.
     #[inline]
-    fn cancel(&mut self, sync: u32) {
+    fn cancel(&mut self, sync: u64) {
         if self.in_flights.remove(&sync).is_some() {
             trace!("Cancelled request with sync {}", sync);
         }
@@ -128,7 +126,7 @@ impl ConnectionData {
 
     /// Send result of processing request (by sync) to client.
     #[inline]
-    fn respond_to_client(&mut self, sync: u32, response: impl Into<DispatcherResponse>) {
+    fn respond_to_client(&mut self, sync: u64, response: Result<Response, Error>) {
         match self.in_flights.remove(&sync) {
             Some(tx) => {
                 if tx.send(response).is_err() {
@@ -150,7 +148,7 @@ impl ConnectionData {
     #[inline]
     fn send_error_to_all_in_flights(&mut self, err: &ConnectionError) {
         for (_, tx) in self.in_flights.drain() {
-            let _ = tx.send(Error::from(err.clone()));
+            let _ = tx.send(Err(Error::from(err.clone())));
         }
     }
 }
@@ -161,7 +159,7 @@ async fn writer_task(
     mut rx: mpsc::Receiver<EncodedRequest>,
     mut stream: FramedWrite<OwnedWriteHalf, ClientCodec>,
     cancellation_token: CancellationToken,
-) -> Result<(), (u32, CodecEncodeError)> {
+) -> Result<(), (u64, CodecEncodeError)> {
     let mut result = Ok(());
 
     loop {
@@ -199,7 +197,7 @@ async fn writer_task(
     result
 }
 
-type WriterTaskJoinHandle = JoinHandle<Result<(), (u32, CodecEncodeError)>>;
+type WriterTaskJoinHandle = JoinHandle<Result<(), (u64, CodecEncodeError)>>;
 
 pub(crate) struct Connection {
     read_stream: FramedRead<OwnedReadHalf, ClientCodec>,
@@ -515,7 +513,7 @@ pub(super) mod tests {
 
     /// Read one request frame sent by the client and return its
     /// `(request_type, sync)`, or `None` once the client closed the socket.
-    async fn read_request(sock: &mut TcpStream) -> Option<(u8, u32)> {
+    async fn read_request(sock: &mut TcpStream) -> Option<(u8, u64)> {
         // `ClientCodec` always writes the length as MP_UINT64: 0xcf + 8 bytes.
         let mut len_buf = [0u8; 9];
         sock.read_exact(&mut len_buf).await.ok()?;
@@ -532,20 +530,17 @@ pub(super) mod tests {
                 .and_then(|(_, v)| v.as_u64())
                 .unwrap()
         };
-        Some((
-            u8::try_from(field(0x00)).unwrap(),
-            u32::try_from(field(0x01)).unwrap(),
-        ))
+        Some((u8::try_from(field(0x00)).unwrap(), field(0x01)))
     }
 
     /// Response frame `{RESPONSE_CODE: 0, SYNC: sync, SCHEMA_VERSION: 1}` + `body`.
-    fn ok_response(sync: u32, body: &Value) -> Vec<u8> {
+    fn ok_response(sync: u64, body: &Value) -> Vec<u8> {
         let mut payload = Vec::new();
         rmp::encode::write_map_len(&mut payload, 3).unwrap();
         rmp::encode::write_pfix(&mut payload, 0x00).unwrap();
         rmp::encode::write_pfix(&mut payload, 0x00).unwrap();
         rmp::encode::write_pfix(&mut payload, 0x01).unwrap();
-        rmp::encode::write_u32(&mut payload, sync).unwrap();
+        rmp::encode::write_uint(&mut payload, sync).unwrap();
         rmp::encode::write_pfix(&mut payload, 0x05).unwrap();
         rmp::encode::write_pfix(&mut payload, 0x01).unwrap();
         rmpv::encode::write_value(&mut payload, body).unwrap();
@@ -567,7 +562,7 @@ pub(super) mod tests {
     }
 
     /// `sync_for` that answers every request with its own sync.
-    pub(crate) fn echo_sync(_request_type: u8, sync: u32) -> u32 {
+    pub(crate) fn echo_sync(_request_type: u8, sync: u64) -> u64 {
         sync
     }
 
@@ -575,7 +570,7 @@ pub(super) mod tests {
     /// OK response (an `IPROTO_ID` one for ID requests). `sync_for` maps the
     /// request's `(request_type, sync)` to the sync put into the response, so
     /// tests can inject a mismatch.
-    pub(crate) async fn spawn_fake_server(sync_for: fn(u8, u32) -> u32) -> String {
+    pub(crate) async fn spawn_fake_server(sync_for: fn(u8, u64) -> u64) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -610,7 +605,7 @@ pub(super) mod tests {
 
     /// Build a connection over a local socket pair, with a custom writer task.
     async fn connection_with_writer(
-        writer: impl Future<Output = Result<(), (u32, CodecEncodeError)>> + Send + 'static,
+        writer: impl Future<Output = Result<(), (u64, CodecEncodeError)>> + Send + 'static,
     ) -> (Connection, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap())
@@ -740,14 +735,14 @@ pub(super) mod tests {
         assert!(!logs_contain("Unknown sync"));
     }
 
-    fn ping_with_sync(sync: u32) -> EncodedRequest {
+    fn ping_with_sync(sync: u64) -> EncodedRequest {
         let mut request = EncodedRequest::new(&Ping {}, None).unwrap();
         *request.sync_mut() = sync;
         request
     }
 
     /// A ping issued through a stream (stream id 1).
-    fn stream_ping_with_sync(sync: u32) -> EncodedRequest {
+    fn stream_ping_with_sync(sync: u64) -> EncodedRequest {
         let mut request = EncodedRequest::new(&Ping {}, Some(1)).unwrap();
         *request.sync_mut() = sync;
         request
@@ -756,7 +751,7 @@ pub(super) mod tests {
     fn client_request(
         request: EncodedRequest,
         generation: Option<u64>,
-        tx: oneshot::Sender<DispatcherResponse>,
+        tx: oneshot::Sender<Result<Response, Error>>,
     ) -> DispatcherMessage {
         DispatcherMessage::Request(ClientRequest {
             request,
@@ -824,10 +819,7 @@ pub(super) mod tests {
             .is_err()
         );
         assert!(data.in_flights.is_empty());
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(DispatcherResponse::Finished(Err(Error::ConnectionReset)))
-        ));
+        assert!(matches!(rx.try_recv(), Ok(Err(Error::ConnectionReset))));
 
         // Control: the same request without a generation is registered.
         let (tx, _rx) = oneshot::channel();
@@ -881,11 +873,8 @@ pub(super) mod tests {
             tokio::join!(conn.run(&mut client_rx, &generation), script);
 
         assert!(run_res.is_ok());
-        assert!(matches!(
-            stale,
-            Ok(DispatcherResponse::Finished(Err(Error::ConnectionReset)))
-        ));
-        assert!(matches!(plain, Ok(DispatcherResponse::Finished(Ok(_)))));
+        assert!(matches!(stale, Ok(Err(Error::ConnectionReset))));
+        assert!(matches!(plain, Ok(Ok(_))));
     }
 
     #[tokio::test]
@@ -926,7 +915,7 @@ pub(super) mod tests {
                 .write_all(&ok_response(6, &Value::Map(Vec::new())))
                 .await
                 .unwrap();
-            assert!(matches!(rx6.await, Ok(DispatcherResponse::Finished(Ok(_)))));
+            assert!(matches!(rx6.await, Ok(Ok(_))));
 
             drop(client_tx);
             server
@@ -936,5 +925,39 @@ pub(super) mod tests {
         assert!(run_res.is_ok());
         assert!(logs_contain("Unknown sync 5"));
         assert!(!logs_contain("receiver dropped"));
+    }
+
+    #[tokio::test]
+    async fn sync_above_u32_reaches_its_caller() {
+        let (conn, mut server) = connected_pair().await;
+        let (client_tx, client_rx) = mpsc::channel::<DispatcherMessage>(4);
+        let mut client_rx = ReceiverStream::new(client_rx);
+        let generation = AtomicU64::new(0);
+        let sync = u64::from(u32::MAX) + 5;
+        let (tx, rx) = oneshot::channel();
+
+        let script = async move {
+            client_tx
+                .send(client_request(ping_with_sync(sync), None, tx))
+                .await
+                .unwrap();
+            // The server sees the whole 64-bit sync and echoes it back.
+            assert_eq!(read_request(&mut server).await.unwrap().1, sync);
+            server
+                .write_all(&ok_response(sync, &Value::Map(Vec::new())))
+                .await
+                .unwrap();
+            let response = rx.await;
+            drop(client_tx);
+            (server, response)
+        };
+        let (run_res, (_server, response)) =
+            tokio::join!(conn.run(&mut client_rx, &generation), script);
+
+        assert!(run_res.is_ok());
+        assert!(
+            matches!(response, Ok(Ok(ref r)) if r.sync == sync),
+            "{response:?}"
+        );
     }
 }

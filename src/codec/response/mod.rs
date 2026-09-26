@@ -18,7 +18,7 @@ pub(crate) enum ResponseBody {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Response {
-    pub sync: u32,
+    pub sync: u64,
     pub schema_version: u32,
     pub body: ResponseBody,
 }
@@ -31,7 +31,7 @@ impl Response {
     pub(super) fn decode(mut buf: &[u8]) -> Result<Self, DecodingError> {
         let map_len = rmp::decode::read_map_len(&mut buf)?;
         let mut response_code: Option<u32> = None;
-        let mut sync: Option<u32> = None;
+        let mut sync: Option<u64> = None;
         let mut schema_version: Option<u32> = None;
         for _ in 0..map_len {
             let key: u8 = rmp::decode::read_pfix(&mut buf)?;
