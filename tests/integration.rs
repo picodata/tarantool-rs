@@ -3,7 +3,7 @@ use std::time::Duration;
 use assert_matches::assert_matches;
 use rmpv::Value;
 use serde::{Deserialize, Serialize};
-use tarantool_rs::{Connection, DmoOperation, Executor, ExecutorExt, errors::Error};
+use tarantool_rs::{Connection, DmoOperation, Executor, ExecutorExt, Stream, errors::Error};
 use tracing_test::traced_test;
 
 use crate::common::{TarantoolTestContainer, TarantoolTestContainerExt};
@@ -307,6 +307,60 @@ async fn restart_mid_transaction_fails_the_stale_transaction() -> Result<(), any
         .select(None, None, Some(tarantool_rs::IteratorType::All), ())
         .await?;
     assert!(rows.is_empty(), "uncommitted insert survived: {rows:?}");
+
+    Ok(())
+}
+
+/// Ping `probe` until it fails with `ConnectionReset`, which proves that the
+/// client observed the loss of the connection the probe was created on.
+async fn wait_until_reset(probe: &Stream, limit: Duration) {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        match probe.ping().await {
+            Err(Error::ConnectionReset) => return,
+            other => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the loss was not observed within {limit:?}: {other:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[traced_test]
+async fn transaction_created_during_outage_commits_after_reconnect() -> Result<(), anyhow::Error> {
+    let container = TarantoolTestContainer::new_restartable();
+    // Long enough for BEGIN to wait out the restart in the queue.
+    let conn = Connection::builder()
+        .timeout(Duration::from_secs(30))
+        .build(format!("127.0.0.1:{}", container.connect_port()))
+        .await?;
+    let probe = conn.stream();
+    probe.ping().await?;
+
+    container.restart();
+    wait_until_reset(&probe, Duration::from_secs(60)).await;
+
+    // Begun after the loss was observed: it belongs to the next connection.
+    let tx = conn.transaction().await?;
+    let space = tx
+        .space("reconnect")
+        .await?
+        .expect("Space 'reconnect' found");
+    let _ = space.insert((10u32,)).await?;
+    drop(space);
+    tx.commit().await?;
+
+    let rows: Vec<(u32,)> = conn
+        .space("reconnect")
+        .await?
+        .expect("Space 'reconnect' found")
+        .select(None, None, Some(tarantool_rs::IteratorType::All), ())
+        .await?;
+    assert_eq!(rows, vec![(10,)]);
 
     Ok(())
 }

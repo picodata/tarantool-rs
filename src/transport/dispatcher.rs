@@ -171,21 +171,13 @@ impl DispatcherSender {
 type ConnectDynFuture = dyn Future<Output = Result<Connection, Error>> + Send;
 type ConnFactory = Box<dyn Fn() -> Pin<Box<ConnectDynFuture>> + Send + Sync>;
 
-/// How [`Dispatcher::reconnect`] ended.
-enum ReconnectOutcome {
-    /// A new connection is in `Dispatcher::conn`.
-    Connected,
-    /// Every client handle was dropped; the dispatcher should stop.
-    ClientsGone,
-}
-
 /// Dispatching messages from client to connection.
 ///
-/// Owns the reconnect loop and bumps the shared generation counter on every
-/// successful reconnect. It closes the connection and exits as soon as the
-/// last client handle is dropped, whether a connection is running or a
-/// reconnect is in progress. Schema reloading and pooling are not implemented
-/// yet.
+/// Owns the reconnect loop and advances the shared generation counter as soon
+/// as a connection is lost, before the first reconnect attempt. It closes the
+/// connection and exits as soon as the last client handle is dropped, whether
+/// a connection is running or a reconnect is in progress. Schema reloading and
+/// pooling are not implemented yet.
 pub(crate) struct Dispatcher {
     rx: mpsc::Receiver<ClientRequest>,
     /// Syncs of the requests whose callers gave up. Unbounded, so a cancel is
@@ -194,9 +186,10 @@ pub(crate) struct Dispatcher {
     conn: Option<Connection>,
     conn_factory: ConnFactory,
     reconnect_interval: Option<ReconnectInterval>,
-    /// Bumped after every successful reconnect, before requests flow on the
-    /// new connection. Streams and transactions compare it with the value
-    /// they captured at creation.
+    /// Advanced as soon as a connection is lost, before the first reconnect
+    /// attempt. Streams and transactions compare it with the value they
+    /// captured at creation; each `Connection::run` gets the value of its own
+    /// connection.
     generation: Arc<AtomicU64>,
     /// Its `closed()` resolves once every client handle is gone; both
     /// `Connection::run` and `reconnect` race it.
@@ -277,31 +270,30 @@ impl Dispatcher {
         )
     }
 
-    async fn reconnect(&mut self) -> ReconnectOutcome {
+    /// Connect again, retrying with the reconnect interval. `None` means that
+    /// every client handle was dropped and the dispatcher should stop.
+    async fn reconnect(&mut self) -> Option<Connection> {
         let mut reconn_int_state = self
             .reconnect_interval
             .as_ref()
             .map(ReconnectIntervalState::from);
         loop {
+            // Liveness first, here and in the backoff below: once the last
+            // client handle is gone, no further connect attempt starts.
             let attempt = tokio::select! {
+                biased;
+                () = self.client_liveness.closed() => return None,
                 res = (self.conn_factory)() => res,
-                () = self.client_liveness.closed() => return ReconnectOutcome::ClientsGone,
             };
             match attempt {
-                Ok(conn) => {
-                    // Bump before `run` lets requests onto the new connection.
-                    self.generation.fetch_add(1, Ordering::AcqRel);
-                    self.conn = Some(conn);
-                    return ReconnectOutcome::Connected;
-                }
+                Ok(conn) => return Some(conn),
                 Err(err) => {
                     error!("Failed to reconnect to Tarantool: {:#}", err);
                     if let Some(ref mut x) = reconn_int_state {
                         tokio::select! {
+                            biased;
+                            () = self.client_liveness.closed() => return None,
                             () = tokio::time::sleep(x.next_timeout()) => {}
-                            () = self.client_liveness.closed() => {
-                                return ReconnectOutcome::ClientsGone;
-                            }
                         }
                     }
                 }
@@ -312,28 +304,32 @@ impl Dispatcher {
     pub(crate) async fn run(mut self) {
         debug!("Starting dispatcher");
         loop {
-            match self.conn.take() {
-                Some(conn) => {
-                    if conn
-                        .run(
-                            &mut self.rx,
-                            &mut self.cancel_rx,
-                            &mut self.client_liveness,
-                            &self.generation,
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        return;
-                    }
-                }
-                None => {
-                    if let ReconnectOutcome::ClientsGone = self.reconnect().await {
-                        debug!("All client handles dropped, stopping dispatcher");
-                        return;
-                    }
-                }
+            let conn = if let Some(conn) = self.conn.take() {
+                conn
+            } else if let Some(conn) = self.reconnect().await {
+                conn
+            } else {
+                debug!("All client handles dropped, stopping dispatcher");
+                return;
+            };
+            let generation = self.generation.load(Ordering::Acquire);
+            if conn
+                .run(
+                    &mut self.rx,
+                    &mut self.cancel_rx,
+                    &mut self.client_liveness,
+                    generation,
+                )
+                .await
+                .is_ok()
+            {
+                return;
             }
+            // Advance as soon as the loss is observed, before the first
+            // reconnect attempt: stale streams and transactions fail fast
+            // during the outage, and the ones created during it carry the
+            // generation of the next connection.
+            self.generation.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -416,12 +412,19 @@ impl From<&ReconnectInterval> for ReconnectIntervalState {
 mod tests {
     use super::*;
 
-    use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    use parking_lot::Mutex;
+    use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle, time::timeout};
 
     use super::super::connection::tests::{
-        echo_sync, fake_greeting, id_response_body, ok_response, read_request, spawn_fake_server,
+        echo_sync, fake_greeting, id_response_body, ok_body_for, ok_response, read_request,
+        spawn_fake_server,
     };
-    use crate::codec::{consts::RequestType, request::Eval};
+    use crate::{
+        ExecutorExt, TransactionIsolationLevel,
+        codec::{consts::RequestType, request::Eval},
+    };
 
     /// Dispatcher with no live connection whose factory connects to `addr`.
     fn dispatcher_for(
@@ -530,18 +533,169 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_bumps_generation() {
+    async fn reconnect_returns_the_connection_and_leaves_the_generation() {
         let addr = spawn_fake_server(echo_sync).await;
         let (mut dispatcher, sender) = dispatcher_for(addr, None);
+
+        assert!(dispatcher.reconnect().await.is_some());
+        // `Dispatcher::run` advances the generation when a connection is lost,
+        // not when a new one comes up.
         assert_eq!(sender.generation(), 0);
+    }
 
-        assert!(matches!(
-            dispatcher.reconnect().await,
-            ReconnectOutcome::Connected
-        ));
+    /// Fake server on one local address that can go down and come back.
+    ///
+    /// While up, it serves every connection: it sends the greeting, answers ID
+    /// with an ID body and every other request with an OK response. Going down
+    /// closes the live sockets; while down, it accepts each new connection
+    /// and closes it at once, counting it as a reconnect attempt.
+    struct FlakyServer {
+        addr: String,
+        up: Arc<AtomicBool>,
+        attempts_while_down: Arc<AtomicUsize>,
+        live: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    }
 
-        assert!(dispatcher.conn.is_some());
-        assert_eq!(sender.generation(), 1);
+    impl FlakyServer {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = Self {
+                addr: listener.local_addr().unwrap().to_string(),
+                up: Arc::new(AtomicBool::new(true)),
+                attempts_while_down: Arc::default(),
+                live: Arc::default(),
+            };
+            let up = server.up.clone();
+            let attempts_while_down = server.attempts_while_down.clone();
+            let live = server.live.clone();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    if !up.load(Ordering::SeqCst) {
+                        attempts_while_down.fetch_add(1, Ordering::SeqCst);
+                        drop(sock);
+                        continue;
+                    }
+                    live.lock().push(tokio::spawn(async move {
+                        if sock.write_all(&fake_greeting()).await.is_err() {
+                            return;
+                        }
+                        while let Some((request_type, sync)) = read_request(&mut sock).await {
+                            let response = ok_response(sync, &ok_body_for(request_type));
+                            if sock.write_all(&response).await.is_err() {
+                                return;
+                            }
+                        }
+                    }));
+                }
+            });
+            server
+        }
+
+        /// Close every live connection and refuse new ones until [`Self::up`].
+        fn down(&self) {
+            self.up.store(false, Ordering::SeqCst);
+            for connection in self.live.lock().drain(..) {
+                connection.abort();
+            }
+        }
+
+        fn up(&self) {
+            self.up.store(true, Ordering::SeqCst);
+        }
+
+        /// Wait until the dispatcher tried to connect while the server was
+        /// down.
+        async fn wait_for_reconnect_attempt(&self) {
+            timeout(Duration::from_secs(2), async {
+                while self.attempts_while_down.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("no reconnect attempt within 2 s");
+        }
+    }
+
+    /// Client `Connection` over a fresh dispatcher to `server`, with a fixed
+    /// 10 ms reconnect interval and `request_timeout`. Returns once the first
+    /// connect succeeded, together with the dispatcher task.
+    async fn connect(
+        server: &FlakyServer,
+        request_timeout: Option<Duration>,
+    ) -> (crate::Connection, JoinHandle<()>) {
+        let (dispatcher, sender) = Dispatcher::prepare(
+            server.addr.clone(),
+            None,
+            None,
+            None,
+            Some(ReconnectInterval::fixed(Duration::from_millis(10))),
+            16,
+        )
+        .await
+        .unwrap();
+        let dispatcher = tokio::spawn(dispatcher);
+        let conn = crate::Connection::new(
+            sender,
+            request_timeout,
+            None,
+            TransactionIsolationLevel::default(),
+            0,
+        );
+        (conn, dispatcher)
+    }
+
+    #[tokio::test]
+    async fn lost_connection_advances_the_generation_before_reconnecting() {
+        let server = FlakyServer::start().await;
+        let (conn, _dispatcher) = connect(&server, None).await;
+        assert_eq!(conn.generation(), 0);
+
+        server.down();
+        server.wait_for_reconnect_attempt().await;
+
+        // The server is still down, and the generation already moved.
+        assert_eq!(conn.generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_created_before_the_loss_fails_fast_during_the_outage() {
+        let server = FlakyServer::start().await;
+        let (conn, _dispatcher) = connect(&server, None).await;
+        let stream = conn.stream();
+        stream.ping().await.unwrap();
+
+        server.down();
+        server.wait_for_reconnect_attempt().await;
+
+        let res = timeout(Duration::from_secs(1), stream.ping())
+            .await
+            .expect("the stale stream waited out the outage");
+        assert!(matches!(res, Err(Error::ConnectionReset)), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_and_transaction_created_during_the_outage_work_after_it() {
+        let server = FlakyServer::start().await;
+        let (conn, _dispatcher) = connect(&server, None).await;
+        server.down();
+        server.wait_for_reconnect_attempt().await;
+
+        let stream = conn.stream();
+        // Its BEGIN waits in the queue until the server is back.
+        let transaction = tokio::spawn({
+            let conn = conn.clone();
+            async move { conn.transaction().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.up();
+
+        timeout(Duration::from_secs(2), stream.ping())
+            .await
+            .expect("no reconnect within 2 s")
+            .unwrap();
+        let transaction = transaction.await.unwrap().unwrap();
+        transaction.ping().await.unwrap();
+        transaction.commit().await.unwrap();
     }
 
     fn exp_backoff_state(

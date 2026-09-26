@@ -180,8 +180,8 @@ impl Connection {
         self.inner.dispatcher_sender.generation()
     }
 
-    /// Fail with [`Error::ConnectionReset`] if the transport connection was
-    /// re-established since `captured` was read.
+    /// Fail with [`Error::ConnectionReset`] if the connection was lost since
+    /// `captured` was read.
     ///
     /// Fast path only: the transport repeats the comparison when it accepts
     /// the request (see [`Self::send_with_generation`]), which catches the

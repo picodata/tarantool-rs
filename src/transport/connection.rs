@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, time::Duration};
 
 use futures::{
     FutureExt, SinkExt, TryStreamExt,
@@ -380,12 +375,16 @@ impl Connection {
     /// then aborts the writer and answers every in-flight request with the
     /// error that ended the connection, or with `ConnectionClosed` when the
     /// clients are gone.
+    ///
+    /// `current_generation` is the generation of this connection, fixed for
+    /// its whole life: a request that a stream or transaction captured under
+    /// another generation is answered with `ConnectionReset`, unsent.
     pub(crate) async fn run(
         self,
         client_rx: &mut mpsc::Receiver<ClientRequest>,
         cancel_rx: &mut mpsc::UnboundedReceiver<u64>,
         client_liveness: &mut oneshot::Sender<()>,
-        current_generation: &AtomicU64,
+        current_generation: u64,
     ) -> Result<(), ()> {
         let Self {
             mut read_stream,
@@ -431,7 +430,7 @@ impl Connection {
                         .try_prepare_request(
                             &request,
                             generation,
-                            current_generation.load(Ordering::Acquire),
+                            current_generation,
                             responder,
                         )
                         .is_err()
@@ -500,7 +499,7 @@ pub(super) mod tests {
     use std::io;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
     use bytes::BytesMut;
@@ -784,14 +783,9 @@ pub(super) mod tests {
         let (mut client_liveness, _client_handle) = oneshot::channel();
         drop(client_tx);
         assert!(
-            conn.run(
-                &mut client_rx,
-                &mut cancel_rx,
-                &mut client_liveness,
-                &AtomicU64::new(0)
-            )
-            .await
-            .is_err()
+            conn.run(&mut client_rx, &mut cancel_rx, &mut client_liveness, 0)
+                .await
+                .is_err()
         );
     }
 
@@ -804,14 +798,9 @@ pub(super) mod tests {
         let (mut client_liveness, _client_handle) = oneshot::channel();
         drop(client_tx);
         assert!(
-            conn.run(
-                &mut client_rx,
-                &mut cancel_rx,
-                &mut client_liveness,
-                &AtomicU64::new(0)
-            )
-            .await
-            .is_ok()
+            conn.run(&mut client_rx, &mut cancel_rx, &mut client_liveness, 0)
+                .await
+                .is_ok()
         );
     }
 
@@ -917,7 +906,7 @@ pub(super) mod tests {
         let (client_tx, mut client_rx) = mpsc::channel(64);
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, _client_handle) = oneshot::channel();
-        let generation = AtomicU64::new(0);
+        let generation = 0;
         let expr = "x".repeat(1024 * 1024);
         let mut receivers = Vec::new();
         for sync in 1..=32 {
@@ -944,7 +933,7 @@ pub(super) mod tests {
                     &mut client_rx,
                     &mut cancel_rx,
                     &mut client_liveness,
-                    &generation
+                    generation
                 ),
                 script
             )
@@ -1014,19 +1003,11 @@ pub(super) mod tests {
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, _client_handle) = oneshot::channel();
         let sender = DispatcherSender::new_for_test(client_tx, cancel_tx, Arc::default());
-        // `join!` borrows across its whole body, so the generation needs a
-        // binding rather than a temporary.
-        let generation = AtomicU64::new(0);
 
         // `join!` keeps both futures inside the test's tracing span, which
         // `logs_contain` needs; a spawned task would log outside it.
         let (run_res, send_res) = tokio::join!(
-            conn.run(
-                &mut client_rx,
-                &mut cancel_rx,
-                &mut client_liveness,
-                &generation
-            ),
+            conn.run(&mut client_rx, &mut cancel_rx, &mut client_liveness, 0),
             sender
                 .requests()
                 .send(EncodedRequest::new(&Ping {}, None).unwrap(), None),
@@ -1122,7 +1103,7 @@ pub(super) mod tests {
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, _client_handle) = oneshot::channel();
         // The dispatcher already reconnected: this connection is generation 1.
-        let generation = AtomicU64::new(1);
+        let generation = 1;
         let (stale_tx, stale_rx) = oneshot::channel();
         let (plain_tx, plain_rx) = oneshot::channel();
 
@@ -1155,7 +1136,7 @@ pub(super) mod tests {
                 &mut client_rx,
                 &mut cancel_rx,
                 &mut client_liveness,
-                &generation
+                generation
             ),
             script
         );
@@ -1172,7 +1153,7 @@ pub(super) mod tests {
         let (client_tx, mut client_rx) = mpsc::channel(4);
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, _client_handle) = oneshot::channel();
-        let generation = AtomicU64::new(0);
+        let generation = 0;
         let (tx5, rx5) = oneshot::channel();
 
         let script = async move {
@@ -1215,7 +1196,7 @@ pub(super) mod tests {
                 &mut client_rx,
                 &mut cancel_rx,
                 &mut client_liveness,
-                &generation
+                generation
             ),
             script
         );
@@ -1231,7 +1212,7 @@ pub(super) mod tests {
         let (client_tx, mut client_rx) = mpsc::channel(4);
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, _client_handle) = oneshot::channel();
-        let generation = AtomicU64::new(0);
+        let generation = 0;
         let sync = u64::from(u32::MAX) + 5;
         let (tx, rx) = oneshot::channel();
 
@@ -1255,7 +1236,7 @@ pub(super) mod tests {
                 &mut client_rx,
                 &mut cancel_rx,
                 &mut client_liveness,
-                &generation
+                generation
             ),
             script
         );
@@ -1282,7 +1263,7 @@ pub(super) mod tests {
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, _client_handle) = oneshot::channel();
         let sender = DispatcherSender::new_for_test(client_tx.clone(), cancel_tx, Arc::default());
-        let generation = AtomicU64::new(0);
+        let generation = 0;
 
         let script = async {
             let mut first = Box::pin(sender.requests().send(ping_with_sync(1), None));
@@ -1317,7 +1298,7 @@ pub(super) mod tests {
                 &mut client_rx,
                 &mut cancel_rx,
                 &mut client_liveness,
-                &generation
+                generation
             ),
             script
         );
@@ -1334,7 +1315,7 @@ pub(super) mod tests {
         let (client_tx, mut client_rx) = mpsc::channel(4);
         let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, _client_handle) = oneshot::channel();
-        let generation = AtomicU64::new(0);
+        let generation = 0;
 
         // The caller of request 7 gave up while the request was queued: its
         // receiver is closed and its cancel is already waiting.
@@ -1367,7 +1348,7 @@ pub(super) mod tests {
                 &mut client_rx,
                 &mut cancel_rx,
                 &mut client_liveness,
-                &generation
+                generation
             ),
             script
         );
@@ -1382,7 +1363,7 @@ pub(super) mod tests {
         let (client_tx, mut client_rx) = mpsc::channel(4);
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, client_handle) = oneshot::channel();
-        let generation = AtomicU64::new(0);
+        let generation = 0;
         let (tx, rx) = oneshot::channel();
 
         let script = async move {
@@ -1405,7 +1386,7 @@ pub(super) mod tests {
                 &mut client_rx,
                 &mut cancel_rx,
                 &mut client_liveness,
-                &generation
+                generation
             ),
             script
         );

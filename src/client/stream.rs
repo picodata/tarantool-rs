@@ -13,7 +13,7 @@ use crate::{Executor, Result, codec::request::EncodedRequest};
 ///
 /// A stream does not survive a reconnect of the underlying [`Connection`]:
 /// its state lived only on the old server session, and any request made
-/// through it after a reconnect fails with
+/// through it after the connection it was created on is lost fails with
 /// [`Error::ConnectionReset`][crate::Error::ConnectionReset] instead of
 /// silently continuing on the new connection.
 ///
