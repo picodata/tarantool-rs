@@ -16,7 +16,7 @@ use tokio::time::timeout;
 use tracing::{debug, trace};
 
 use crate::{
-    Error, ExecutorExt, Result,
+    ExecutorExt, Result,
     builder::ConnectionBuilder,
     client::{Executor, Stream, Transaction, TransactionBuilder},
     codec::{
@@ -39,8 +39,8 @@ use crate::{
 /// directly through a `Connection`. A [`Stream`] or [`Transaction`] created
 /// from it does not survive a reconnect: its state lived only on the old
 /// server session, so a request made through it afterwards fails with
-/// [`Error::ConnectionReset`] instead of silently rebinding to the new
-/// connection.
+/// [`Error::ConnectionReset`][crate::Error::ConnectionReset] instead of
+/// silently rebinding to the new connection.
 #[derive(Clone)]
 pub struct Connection {
     inner: Arc<ConnectionInner>,
@@ -148,9 +148,10 @@ impl Connection {
     ///
     /// `generation` is the value a `Stream` or `Transaction` captured at
     /// creation, `None` for plain requests. The transport answers a request
-    /// whose generation is no longer current with [`Error::ConnectionReset`]
-    /// instead of sending it, which also covers requests that were already
-    /// waiting in the dispatcher queue when a reconnect happened.
+    /// whose generation is no longer current with
+    /// [`Error::ConnectionReset`][crate::Error::ConnectionReset] instead of
+    /// sending it, which also covers requests that were already waiting in the
+    /// dispatcher queue when a reconnect happened.
     ///
     /// Dropping the returned future once the request is queued, for example
     /// on the request timeout, cancels the request in the transport.
@@ -178,21 +179,6 @@ impl Connection {
     /// Generation of the underlying transport connection.
     pub(crate) fn generation(&self) -> u64 {
         self.inner.dispatcher_sender.generation()
-    }
-
-    /// Fail with [`Error::ConnectionReset`] if the connection was lost since
-    /// `captured` was read.
-    ///
-    /// Fast path only: the transport repeats the comparison when it accepts
-    /// the request (see [`Self::send_with_generation`]), which catches the
-    /// requests that pass this check and then wait out a reconnect in the
-    /// dispatcher queue.
-    pub(crate) fn check_generation(&self, captured: u64) -> Result<()> {
-        if self.generation() == captured {
-            Ok(())
-        } else {
-            Err(Error::ConnectionReset)
-        }
     }
 
     pub(crate) fn stream(&self) -> Stream {
@@ -305,7 +291,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::consts::RequestType, codec::response::Response, errors::ErrorResponse,
+        codec::consts::RequestType,
+        codec::response::Response,
+        errors::{Error, ErrorResponse, TransactionError},
         transport::ClientRequest,
     };
 
@@ -414,8 +402,18 @@ mod tests {
 
         let transaction = conn.transaction().await.unwrap();
         let res = transaction.commit().await;
-        assert!(matches!(res, Err(Error::Response(_))), "{res:?}");
+        assert!(
+            matches!(
+                res,
+                Err(TransactionError {
+                    error: Error::Response(_),
+                    ..
+                })
+            ),
+            "{res:?}"
+        );
 
+        drop(res);
         // Give a drop-time rollback, if any, the chance to reach the dispatcher.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
@@ -435,8 +433,18 @@ mod tests {
 
         let transaction = conn.transaction().await.unwrap();
         let res = transaction.rollback().await;
-        assert!(matches!(res, Err(Error::Response(_))), "{res:?}");
+        assert!(
+            matches!(
+                res,
+                Err(TransactionError {
+                    error: Error::Response(_),
+                    ..
+                })
+            ),
+            "{res:?}"
+        );
 
+        drop(res);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             kinds(&seen),
@@ -444,6 +452,181 @@ mod tests {
                 (RequestType::Begin as u8, Some(1)),
                 (RequestType::Rollback as u8, Some(1)),
             ]
+        );
+    }
+
+    /// `(request_type, stream_id)` of the next queued request, left
+    /// unanswered.
+    async fn next_request(rx: &mut mpsc::Receiver<ClientRequest>) -> (u8, Option<u32>) {
+        let ClientRequest { request, .. } = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("no request within 1 s")
+            .expect("the queue is closed");
+        (request.request_type as u8, request.stream_id)
+    }
+
+    /// Answer the next queued request OK and return its
+    /// `(request_type, stream_id)`.
+    async fn answer_next(rx: &mut mpsc::Receiver<ClientRequest>) -> (u8, Option<u32>) {
+        let ClientRequest {
+            request, responder, ..
+        } = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("no request within 1 s")
+            .expect("the queue is closed");
+        let _ = responder.send(Ok(Response {
+            sync: request.sync,
+            schema_version: 1,
+            body: ok_body(0),
+        }));
+        (request.request_type as u8, request.stream_id)
+    }
+
+    /// A transaction on stream 1 of a connection with a 50 ms request timeout
+    /// and a queue of `capacity` that only the test reads; the test answered
+    /// its BEGIN.
+    async fn begun_transaction(
+        capacity: usize,
+    ) -> (Connection, Transaction, mpsc::Receiver<ClientRequest>) {
+        let (tx, mut rx) = mpsc::channel(capacity);
+        let conn = test_connection(tx, Arc::default(), Some(Duration::from_millis(50)));
+        let (transaction, begin) = tokio::join!(conn.transaction(), answer_next(&mut rx));
+        assert_eq!(begin, (RequestType::Begin as u8, Some(1)));
+        (conn, transaction.unwrap(), rx)
+    }
+
+    const COMMIT: (u8, Option<u32>) = (RequestType::Commit as u8, Some(1));
+    const ROLLBACK: (u8, Option<u32>) = (RequestType::Rollback as u8, Some(1));
+
+    #[tokio::test]
+    async fn commit_timed_out_while_queued_rolls_back_when_the_error_drops() {
+        let (_conn, transaction, mut rx) = begun_transaction(8).await;
+
+        let err = transaction.commit().await.unwrap_err();
+        assert!(matches!(err.error, Error::Timeout), "{:?}", err.error);
+        // The COMMIT sits in the queue, unanswered.
+        assert_eq!(next_request(&mut rx).await, COMMIT);
+
+        drop(err);
+        assert_eq!(next_request(&mut rx).await, ROLLBACK);
+    }
+
+    #[tokio::test]
+    async fn commit_timed_out_while_queued_can_be_committed_again() {
+        let (_conn, transaction, mut rx) = begun_transaction(8).await;
+        let err = transaction.commit().await.unwrap_err();
+        assert_eq!(next_request(&mut rx).await, COMMIT);
+
+        let (res, retried) = tokio::join!(err.transaction.commit(), answer_next(&mut rx));
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(retried, COMMIT);
+        // Committed: nothing follows, not even a drop-time ROLLBACK.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "a request followed the commit");
+    }
+
+    #[tokio::test]
+    async fn commit_timed_out_waiting_for_queue_capacity_rolls_back_when_the_error_drops() {
+        let (conn, transaction, mut rx) = begun_transaction(1).await;
+        // Another request takes the only slot of the queue.
+        let mut filler = conn.ping();
+        assert!(futures::poll!(filler.as_mut()).is_pending());
+
+        let err = transaction.commit().await.unwrap_err();
+        assert!(matches!(err.error, Error::Timeout), "{:?}", err.error);
+        drop(err);
+
+        // Once capacity frees up, the ROLLBACK follows; the COMMIT never
+        // entered the queue.
+        assert_eq!(next_request(&mut rx).await, (RequestType::Ping as u8, None));
+        assert_eq!(next_request(&mut rx).await, ROLLBACK);
+        drop(filler);
+    }
+
+    #[tokio::test]
+    async fn commit_timed_out_waiting_for_queue_capacity_can_be_committed_again() {
+        let (conn, transaction, mut rx) = begun_transaction(1).await;
+        let mut filler = conn.ping();
+        assert!(futures::poll!(filler.as_mut()).is_pending());
+        let err = transaction.commit().await.unwrap_err();
+
+        let (res, (first, retried)) = tokio::join!(err.transaction.commit(), async {
+            (next_request(&mut rx).await, answer_next(&mut rx).await)
+        });
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(first, (RequestType::Ping as u8, None));
+        assert_eq!(retried, COMMIT);
+        drop(filler);
+    }
+
+    #[tokio::test]
+    async fn rollback_timed_out_while_queued_rolls_back_when_the_error_drops() {
+        let (_conn, transaction, mut rx) = begun_transaction(8).await;
+
+        let err = transaction.rollback().await.unwrap_err();
+        assert!(matches!(err.error, Error::Timeout), "{:?}", err.error);
+        assert_eq!(next_request(&mut rx).await, ROLLBACK);
+
+        drop(err);
+        assert_eq!(next_request(&mut rx).await, ROLLBACK);
+    }
+
+    #[tokio::test]
+    async fn rollback_timed_out_while_queued_can_be_rolled_back_again() {
+        let (_conn, transaction, mut rx) = begun_transaction(8).await;
+        let err = transaction.rollback().await.unwrap_err();
+        assert_eq!(next_request(&mut rx).await, ROLLBACK);
+
+        let (res, retried) = tokio::join!(err.transaction.rollback(), answer_next(&mut rx));
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(retried, ROLLBACK);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "a request followed the rollback");
+    }
+
+    #[tokio::test]
+    async fn transaction_error_converted_into_error_rolls_back() {
+        let (_conn, transaction, mut rx) = begun_transaction(8).await;
+        let err = transaction.commit().await.unwrap_err();
+        assert_eq!(next_request(&mut rx).await, COMMIT);
+
+        let err: Error = err.into();
+        assert!(matches!(err, Error::Timeout), "{err:?}");
+        assert_eq!(next_request(&mut rx).await, ROLLBACK);
+    }
+
+    #[tokio::test]
+    async fn dropped_open_transaction_rolls_back() {
+        let (_conn, transaction, mut rx) = begun_transaction(8).await;
+        drop(transaction);
+        assert_eq!(next_request(&mut rx).await, ROLLBACK);
+    }
+
+    #[tokio::test]
+    async fn transaction_finished_by_a_server_error_sends_nothing_more() {
+        let (tx, rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+        let seen = spawn_fake_dispatcher(rx, reject_commit_and_rollback);
+
+        let transaction = conn.transaction().await.unwrap();
+        let err = transaction.commit().await.unwrap_err();
+        assert!(matches!(err.error, Error::Response(_)), "{:?}", err.error);
+
+        // Sent, a retried COMMIT would succeed on a stream without a
+        // transaction, and a ping would run outside one: both fail unsent.
+        let retried = err.transaction.commit().await.unwrap_err();
+        assert!(
+            matches!(retried.error, Error::Other(_)),
+            "{:?}",
+            retried.error
+        );
+        let res = retried.transaction.ping().await;
+        assert!(matches!(res, Err(Error::Other(_))), "{res:?}");
+        drop(retried);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            kinds(&seen),
+            vec![(RequestType::Begin as u8, Some(1)), COMMIT]
         );
     }
 

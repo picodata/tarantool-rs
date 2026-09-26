@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use rmpv::Value;
 
 use super::{Connection, Transaction, TransactionBuilder};
-use crate::{Executor, Result, codec::request::EncodedRequest};
+use crate::{Error, Executor, Result, codec::request::EncodedRequest};
 
 /// Abstraction, providing sequential processing of requests.
 ///
@@ -14,8 +14,8 @@ use crate::{Executor, Result, codec::request::EncodedRequest};
 /// A stream does not survive a reconnect of the underlying [`Connection`]:
 /// its state lived only on the old server session, and any request made
 /// through it after the connection it was created on is lost fails with
-/// [`Error::ConnectionReset`][crate::Error::ConnectionReset] instead of
-/// silently continuing on the new connection.
+/// [`Error::ConnectionReset`] instead of silently continuing on the new
+/// connection.
 ///
 /// # Example
 ///
@@ -50,9 +50,9 @@ use crate::{Executor, Result, codec::request::EncodedRequest};
 
 #[derive(Clone)]
 pub struct Stream {
-    conn: Connection,
-    id: u32,
-    generation: u64,
+    pub(super) conn: Connection,
+    pub(super) id: u32,
+    pub(super) generation: u64,
 }
 
 // TODO: convert stream to transaction and back
@@ -66,12 +66,26 @@ impl Stream {
             generation,
         }
     }
+
+    /// Fail with [`Error::ConnectionReset`] once the connection this stream
+    /// was created on is lost.
+    ///
+    /// Fast path only: the transport repeats the comparison when it accepts
+    /// the request, which catches the requests that pass here and then wait
+    /// out a reconnect in the dispatcher queue.
+    pub(super) fn check_generation(&self) -> Result<()> {
+        if self.conn.generation() == self.generation {
+            Ok(())
+        } else {
+            Err(Error::ConnectionReset)
+        }
+    }
 }
 
 #[async_trait]
 impl Executor for Stream {
     async fn send_encoded_request(&self, mut request: EncodedRequest) -> Result<Value> {
-        self.conn.check_generation(self.generation)?;
+        self.check_generation()?;
         request.stream_id = Some(self.id);
         self.conn
             .send_with_generation(request, Some(self.generation))

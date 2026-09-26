@@ -81,7 +81,7 @@ pub use self::{
     builder::{ConnectionBuilder, ReconnectInterval},
     client::*,
     codec::consts::{IteratorType, TransactionIsolationLevel},
-    errors::Error,
+    errors::{Error, TransactionError},
     tuple::{Tuple, TupleElement},
 };
 

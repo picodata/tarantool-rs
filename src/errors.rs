@@ -9,6 +9,8 @@ use rmp::{
 use rmpv::Value;
 use tokio::{task::JoinError, time::error::Elapsed};
 
+use crate::Transaction;
+
 /// Error returned by Tarantool in response to a request.
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("{description} (code {code})")]
@@ -90,6 +92,48 @@ pub enum Error {
 impl From<tokio::io::Error> for Error {
     fn from(v: tokio::io::Error) -> Self {
         Self::Io(Arc::new(v))
+    }
+}
+
+/// Error of [`Transaction::commit`] and [`Transaction::rollback`], and of
+/// their wrappers on `Space<Transaction>` and `OwnedIndex<Transaction>`.
+///
+/// `error` says what failed. After a client-side failure, such as
+/// [`Error::Timeout`] or [`Error::ConnectionClosed`], `transaction` comes
+/// back unfinished, but the outcome of a COMMIT is unknown. It may have been
+/// applied, may have failed on the server, or may never have been sent.
+/// Commit or roll back `transaction` again, or drop it. Dropping it, or
+/// converting this error into [`Error`] (which `?` does), sends the ROLLBACK
+/// in the background.
+///
+/// A retried COMMIT and a ROLLBACK succeed in every one of these cases,
+/// because Tarantool treats COMMIT and ROLLBACK without an active
+/// transaction as successful no-ops. So neither proves what happened. After
+/// a timeout, check the data or make the operation idempotent. After a lost
+/// connection the handle is stale: a retry fails with
+/// [`Error::ConnectionReset`], and dropping it sends nothing.
+///
+/// When `error` is [`Error::Response`], the server answered and the
+/// transaction is over: `transaction` is finished, every request through it
+/// fails without being sent, and dropping it sends nothing.
+///
+/// With `anyhow`, `?` moves the whole `TransactionError`, the transaction
+/// included, into the `anyhow::Error`, so the ROLLBACK is sent only when that
+/// error is dropped.
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to commit or roll back the transaction")]
+pub struct TransactionError {
+    /// What failed.
+    #[source]
+    pub error: Error,
+    /// The transaction `commit` or `rollback` consumed.
+    pub transaction: Transaction,
+}
+
+impl From<TransactionError> for Error {
+    fn from(value: TransactionError) -> Self {
+        // Drops the transaction, which rolls it back unless it is finished.
+        value.error
     }
 }
 

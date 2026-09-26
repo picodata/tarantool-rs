@@ -5,8 +5,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 
 use super::{PRIMARY_INDEX_ID, SpaceMetadata, SystemSpacesId};
 use crate::{
-    DmoResponse, Executor, IteratorType, Result, Transaction, client::ExecutorExt, tuple::Tuple,
-    utils::UniqueIdName,
+    DmoResponse, Executor, IteratorType, Result, Transaction, client::ExecutorExt,
+    errors::TransactionError, tuple::Tuple, utils::UniqueIdName,
 };
 
 /// Index metadata from [system view](https://www.tarantool.io/en/doc/latest/reference/reference_lua/box_space/system_views/).
@@ -239,20 +239,37 @@ where
 
 impl OwnedIndex<Transaction> {
     /// Commit inner tranasction.
+    ///
+    /// For details see [`Transaction::commit`].
     /// # Errors
     ///
-    /// Returns an error if the request failed to reach Tarantool or
-    /// Tarantool responded with an error.
-    pub async fn commit(self) -> Result<()> {
+    /// Every failure returns a [`TransactionError`] with the transaction in
+    /// it; the `OwnedIndex` is not returned. A server error
+    /// ([`Error::Response`][crate::Error::Response]) finishes the transaction,
+    /// and a finished one stays finished. Any other failure hands the
+    /// transaction back unfinished, but the outcome of the COMMIT is unknown:
+    /// it may have been applied, may have failed on the server, or may never
+    /// have been sent. A retried COMMIT and a ROLLBACK succeed in every one of
+    /// these cases, so neither proves what happened. After a lost connection
+    /// the transaction is stale: a retry fails with
+    /// [`Error::ConnectionReset`][crate::Error::ConnectionReset], and
+    /// dropping it sends nothing.
+    pub async fn commit(self) -> std::result::Result<(), TransactionError> {
         self.executor.commit().await
     }
 
     /// Rollback inner tranasction.
+    ///
+    /// For details see [`Transaction::rollback`].
     /// # Errors
     ///
-    /// Returns an error if the request failed to reach Tarantool or
-    /// Tarantool responded with an error.
-    pub async fn rollback(self) -> Result<()> {
+    /// Every failure returns a [`TransactionError`] with the transaction in
+    /// it; the `OwnedIndex` is not returned. A server error
+    /// ([`Error::Response`][crate::Error::Response]) finishes the transaction,
+    /// and a finished one stays finished. Any other failure hands the
+    /// transaction back unfinished: the ROLLBACK may have been applied, or may
+    /// never have been sent.
+    pub async fn rollback(self) -> std::result::Result<(), TransactionError> {
         self.executor.rollback().await
     }
 }
