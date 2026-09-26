@@ -1,6 +1,7 @@
 use std::{cmp::max, fmt::Display, time::Duration};
 
-use tokio::net::ToSocketAddrs;
+use tokio::{net::ToSocketAddrs, sync::Semaphore};
+use tracing::warn;
 
 use crate::{
     client::Connection, codec::consts::TransactionIsolationLevel, errors::Error,
@@ -11,6 +12,20 @@ const DEFAULT_DISPATCHER_INTERNAL_QUEUE_SIZE: usize = 500;
 const DEFAULT_SQL_STATEMENT_CACHE_CAPACITY: usize = 500;
 
 /// Interval parameters for background reconnection.
+///
+/// `ExponentialBackoff` is normalized the same way whether it comes from
+/// [`ReconnectInterval::exponential_backoff`] or from a struct literal:
+///
+/// - `min` is at least 1 µs, since a zero interval could never grow;
+/// - `max` is at least `min`;
+/// - `randomization_factor` is clamped to `[0.0, 1.0]`, and NaN counts as
+///   `0.0`;
+/// - a `multiplier` of 1.0 or more, infinity included, is used as given; NaN,
+///   zero, negative values and values below 1.0 make every retry after the
+///   first wait `max`.
+///
+/// A zero or tiny interval, a `Fixed` one or a tiny `min` with `max` at or
+/// near it, retries back to back, like `reconnect_interval(None)`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReconnectInterval {
     Fixed(Duration),
@@ -40,11 +55,9 @@ impl ReconnectInterval {
     ///
     /// Each attempt the interval is randomized within
     /// `[1 - randomization_factor, 1 + randomization_factor]` of its current
-    /// value and then grows by `multiplier`, capped at `max_interval`
-    /// (mirrors the behavior of the former `backoff` crate).
-    ///
-    /// `randomization_factor` is clamped to `[0.0, 1.0]` and `multiplier`
-    /// to `[0.0, +inf)`; `NaN` falls back to `0.0` and `1.0` respectively.
+    /// value and then grows by `multiplier`, capped at `max_interval`. The
+    /// parameters are normalized as [`ReconnectInterval`] describes; a zero or
+    /// tiny interval retries back to back.
     #[must_use]
     pub fn exponential_backoff(
         min_interval: Duration,
@@ -96,7 +109,9 @@ impl ConnectionBuilder {
     /// # Errors
     ///
     /// Returns an error if the connection to Tarantool cannot be
-    /// established or authentication fails.
+    /// established or authentication fails, and [`Error::ConnectTimeout`] if
+    /// setup takes longer than `connect_timeout`, or than `timeout` when
+    /// `connect_timeout` is unset.
     pub async fn build<A>(&self, addr: A) -> Result<Connection, Error>
     where
         A: ToSocketAddrs + Display + Clone + Send + Sync + 'static,
@@ -105,9 +120,11 @@ impl ConnectionBuilder {
             addr,
             self.user.as_deref(),
             self.password.as_deref(),
-            self.connect_timeout,
+            // Setup is bounded by `connect_timeout`, or by the request timeout
+            // when it is unset.
+            self.connect_timeout.or(self.timeout),
             self.reconnect_interval.clone(),
-            self.internal_simultaneous_requests_threshold,
+            clamp_threshold(self.internal_simultaneous_requests_threshold),
         )
         .await?;
 
@@ -132,6 +149,9 @@ impl ConnectionBuilder {
     }
 
     /// Sets timeout for requests.
+    ///
+    /// It also bounds connection setup (TCP connect, greeting, AUTH and ID)
+    /// when `connect_timeout` is unset.
     ///
     /// By default disabled.
     pub fn timeout(&mut self, timeout: impl Into<Option<Duration>>) -> &mut Self {
@@ -161,7 +181,13 @@ impl ConnectionBuilder {
         self
     }
 
-    /// Sets timeout for connect.
+    /// Sets timeout for connection setup: TCP connect, greeting, AUTH and ID,
+    /// of the first connection and of every reconnect attempt. A stalled
+    /// attempt fails with [`Error::ConnectTimeout`] and is retried after the
+    /// reconnect interval.
+    ///
+    /// When it is unset, the request timeout (see [`Self::timeout`]) applies;
+    /// with neither set, setup is unbounded.
     ///
     /// By default disabled.
     pub fn connect_timeout(&mut self, connect_timeout: impl Into<Option<Duration>>) -> &mut Self {
@@ -206,16 +232,37 @@ impl ConnectionBuilder {
     ///
     /// By default set to 500, which should be reasonable compromise between memory
     /// (about 100 KB) and performance.
+    ///
+    /// The accepted range is `[1, tokio::sync::Semaphore::MAX_PERMITS]`;
+    /// `build` clamps a value outside it and logs a warning.
     pub fn internal_simultaneous_requests_threshold(&mut self, value: usize) -> &mut Self {
         self.internal_simultaneous_requests_threshold = value;
         self
     }
 }
 
+/// Clamp the threshold to the range both channels it sizes accept.
+fn clamp_threshold(value: usize) -> usize {
+    let clamped = value.clamp(1, Semaphore::MAX_PERMITS);
+    if clamped != value {
+        warn!(
+            "internal_simultaneous_requests_threshold {value} is outside [1, {}], using {clamped}",
+            Semaphore::MAX_PERMITS
+        );
+    }
+    clamped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::{net::TcpListener, time::Instant};
+    use tracing_test::traced_test;
+
+    use crate::{
+        ExecutorExt,
+        transport::{echo_sync, spawn_fake_server},
+    };
 
     #[tokio::test]
     async fn connect_timeout_is_applied() {
@@ -233,5 +280,76 @@ mod tests {
         .expect("connect_timeout was not applied");
         assert!(matches!(res, Err(Error::ConnectTimeout)), "{res:?}");
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn request_timeout_bounds_setup_when_connect_timeout_is_unset() {
+        // Listener which never sends the greeting
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let started = Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            Connection::builder()
+                .timeout(Duration::from_millis(100))
+                .build(addr),
+        )
+        .await
+        .expect("setup was not bounded by the request timeout");
+        assert!(matches!(res, Err(Error::ConnectTimeout)), "{res:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_bounds_setup_when_both_are_set() {
+        // Listener which never sends the greeting
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let started = Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            Connection::builder()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_millis(100))
+                .build(addr),
+        )
+        .await
+        .expect("setup waited for the longer request timeout");
+        assert!(matches!(res, Err(Error::ConnectTimeout)), "{res:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn threshold_outside_its_range_is_clamped() {
+        for threshold in [0, usize::MAX] {
+            let addr = spawn_fake_server(echo_sync).await;
+            let conn = Connection::builder()
+                .internal_simultaneous_requests_threshold(threshold)
+                .build(addr)
+                .await
+                .unwrap_or_else(|err| panic!("threshold {threshold}: {err:?}"));
+            conn.ping().await.unwrap();
+        }
+    }
+
+    #[test]
+    #[traced_test]
+    fn clamp_threshold_keeps_values_in_range_and_warns_about_the_rest() {
+        assert_eq!(clamp_threshold(500), 500);
+        assert!(!logs_contain("is outside"));
+
+        assert_eq!(clamp_threshold(0), 1);
+        assert!(logs_contain(
+            "internal_simultaneous_requests_threshold 0 is outside"
+        ));
+        assert_eq!(clamp_threshold(usize::MAX), Semaphore::MAX_PERMITS);
+        assert!(logs_contain(&format!(
+            "internal_simultaneous_requests_threshold {} is outside",
+            usize::MAX
+        )));
     }
 }

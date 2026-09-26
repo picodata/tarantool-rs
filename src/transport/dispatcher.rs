@@ -357,23 +357,23 @@ impl ReconnectIntervalState {
                 randomization_factor,
                 multiplier,
             } => {
-                // Mirrors `backoff::ExponentialBackoff` with unlimited elapsed
-                // time: the returned interval is the current one randomized
-                // within [1 - randomization_factor, 1 + randomization_factor],
-                // after which the current interval grows by multiplier, capped
-                // at max (the randomized value itself may exceed max, exactly
-                // as in the original crate).
-                let delta = current.mul_f64(*randomization_factor);
-                let low = current.saturating_sub(delta);
-                let jittered = low + (delta + delta).mul_f64(fastrand::f64());
-                // The f64 comparison guards `mul_f64` against overflowing
-                // `Duration` with a huge multiplier.
-                *current = if current.as_secs_f64() * *multiplier >= max.as_secs_f64() {
-                    *max
+                // The returned interval is the current one randomized within
+                // [1 - randomization_factor, 1 + randomization_factor]; it may
+                // exceed `max`, as in the former `backoff` crate. The current
+                // interval then grows by `multiplier`, capped at `max`. The
+                // arithmetic runs in f64 seconds with one checked conversion
+                // per result, so nothing can panic.
+                let base = current.as_secs_f64();
+                let delta = base * *randomization_factor;
+                let jittered = base - delta + 2.0 * delta * fastrand::f64();
+                let next = base * *multiplier;
+                // `<` is false for NaN, so a NaN product lands on `max` too.
+                *current = if next < max.as_secs_f64() {
+                    Duration::try_from_secs_f64(next).unwrap_or(*max)
                 } else {
-                    current.mul_f64(*multiplier)
+                    *max
                 };
-                jittered
+                Duration::try_from_secs_f64(jittered).unwrap_or(Duration::MAX)
             }
         }
     }
@@ -388,22 +388,29 @@ impl From<&ReconnectInterval> for ReconnectIntervalState {
                 max,
                 randomization_factor,
                 multiplier,
-            } => Self::ExponentialBackoff {
-                current: *min,
-                max: *max,
-                // Clamp so that `Duration::mul_f64` in `next_timeout` cannot
-                // panic on a negative or NaN factor.
-                randomization_factor: if randomization_factor.is_nan() {
-                    0.0
-                } else {
-                    randomization_factor.clamp(0.0, 1.0)
-                },
-                multiplier: if multiplier.is_nan() {
-                    1.0
-                } else {
-                    multiplier.max(0.0)
-                },
-            },
+            } => {
+                // A zero interval could never grow.
+                let min = (*min).max(Duration::from_micros(1));
+                Self::ExponentialBackoff {
+                    current: min,
+                    // The base interval never drops below `min`.
+                    max: (*max).max(min),
+                    randomization_factor: if randomization_factor.is_nan() {
+                        0.0
+                    } else {
+                        randomization_factor.clamp(0.0, 1.0)
+                    },
+                    // Below 1.0 the interval never grows, which retries back
+                    // to back by accident: infinity makes every retry after
+                    // the first wait `max`, as the `backoff` crate did for a
+                    // negative multiplier. The comparison is false for NaN.
+                    multiplier: if *multiplier >= 1.0 {
+                        *multiplier
+                    } else {
+                        f64::INFINITY
+                    },
+                }
+            }
         }
     }
 }
@@ -876,9 +883,9 @@ mod tests {
             1.0,
         );
         for _ in 0..1000 {
-            let timeout = state.next_timeout();
-            assert!(timeout >= Duration::from_millis(50), "{timeout:?}");
-            assert!(timeout <= Duration::from_millis(150), "{timeout:?}");
+            let interval = state.next_timeout();
+            assert!(interval >= Duration::from_millis(50), "{interval:?}");
+            assert!(interval <= Duration::from_millis(150), "{interval:?}");
         }
     }
 
@@ -900,5 +907,98 @@ mod tests {
                 assert!(state.next_timeout() <= Duration::from_secs(2));
             }
         }
+
+        // A zero `min`, which only a struct literal can carry past the
+        // constructor, a zero `max` and `Duration::MAX` as `max`.
+        for (min, max) in [
+            (Duration::ZERO, Duration::from_secs(1)),
+            (Duration::from_millis(1), Duration::ZERO),
+            (Duration::from_millis(1), Duration::MAX),
+        ] {
+            // The base interval stays within the normalized [min_n, max_n],
+            // and the jitter of 0.5 moves it by at most half either way, so
+            // every interval lies in [min_n * 0.5, max_n * 1.5], the upper
+            // edge saturating at `Duration::MAX`. The lower edge is positive.
+            let min_n = min.max(Duration::from_micros(1));
+            let max_n = max.max(min_n);
+            let envelope = min_n / 2..=max_n.saturating_add(max_n / 2);
+            for multiplier in [f64::INFINITY, f64::NAN, 0.0, 0.5, -2.0, 5.0] {
+                let mut state = exp_backoff_state(min, max, 0.5, multiplier);
+                for _ in 0..10 {
+                    let interval = state.next_timeout();
+                    assert!(
+                        envelope.contains(&interval),
+                        "min {min:?} max {max:?} multiplier {multiplier}: {interval:?} \
+                         outside {envelope:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exponential_backoff_never_retries_back_to_back_by_accident() {
+        let min = Duration::from_millis(10);
+        let max = Duration::from_millis(40);
+        for multiplier in [f64::NAN, 0.0, 0.5, -2.0] {
+            let mut state = exp_backoff_state(min, max, 0.0, multiplier);
+            assert_eq!(state.next_timeout(), min, "multiplier {multiplier}");
+            // Every retry after the first waits `max`.
+            for _ in 0..5 {
+                assert_eq!(state.next_timeout(), max, "multiplier {multiplier}");
+            }
+        }
+
+        // A zero `min` is floored at 1 µs.
+        let mut state = exp_backoff_state(Duration::ZERO, max, 0.0, 2.0);
+        for _ in 0..10 {
+            assert!(state.next_timeout() >= Duration::from_micros(1));
+        }
+
+        // A `max` below `min` is raised to `min`.
+        let mut state = exp_backoff_state(min, Duration::ZERO, 0.0, 2.0);
+        for _ in 0..10 {
+            assert_eq!(state.next_timeout(), min);
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_reconnect_attempts_are_bounded_and_retried() {
+        // Accepts every connection and never greets.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(sock);
+            }
+        });
+        let (dispatcher, sender) = Dispatcher::new(
+            Box::new(move || {
+                let addr = addr.clone();
+                Box::pin(async move {
+                    Connection::new(addr, None, None, Some(Duration::from_millis(100)), 16).await
+                }) as Pin<Box<ConnectDynFuture>>
+            }),
+            None,
+            Some(ReconnectInterval::fixed(Duration::from_millis(10))),
+            4,
+        );
+        let dispatcher = tokio::spawn(dispatcher.run());
+
+        // Each attempt stalls for 100 ms, fails with `ConnectTimeout` and is
+        // retried 10 ms later.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let attempts = accepted.load(Ordering::SeqCst);
+        assert!(attempts >= 5, "{attempts} attempts in 1 s");
+
+        drop(sender);
+        timeout(Duration::from_secs(2), dispatcher)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

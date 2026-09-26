@@ -246,10 +246,11 @@ impl Connection {
         }
 
         // TODO: review size of this queue
-        // Make this queue slightly larger than queue between Client and Dispatcher
-        let (writer_tx, writer_rx) = mpsc::channel(
-            (internal_simultaneous_requests_threshold.saturating_mul(105) / 100).max(1),
-        );
+        // Make this queue slightly larger than queue between Client and Dispatcher.
+        // `ConnectionBuilder::build` clamps the threshold to
+        // [1, Semaphore::MAX_PERMITS], so this size stays in range as well.
+        let (writer_tx, writer_rx) =
+            mpsc::channel(internal_simultaneous_requests_threshold.saturating_mul(105) / 100);
         let writer_task_handle = tokio::spawn(writer_task(writer_rx, write_stream));
 
         let this = Self {
