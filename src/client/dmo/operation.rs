@@ -114,15 +114,17 @@ impl<'a> DmoOperation<'a> {
         Self::new(ops::ASSIGN, field_name, Args::One(value.into()))
     }
 
-    pub fn delete(field_name: impl Into<DmoOperationFieldKey<'a>>) -> Self {
-        Self::new(ops::DEL, field_name, Args::None)
+    /// Remove `count` fields, starting at `field_name`.
+    ///
+    /// `count` must be at least 1: the server rejects 0.
+    pub fn delete(field_name: impl Into<DmoOperationFieldKey<'a>>, count: u32) -> Self {
+        Self::new(ops::DEL, field_name, Args::One(count.into()))
     }
 }
 
 impl TupleElement for DmoOperation<'_> {
     fn encode_into_writer<W: Write>(&self, mut buf: W) -> Result<(), EncodingError> {
         let arr_len = 2 + match self.args {
-            Args::None => 0,
             Args::One(_) => 1,
             Args::Three(_, _, _) => 3,
         };
@@ -130,7 +132,6 @@ impl TupleElement for DmoOperation<'_> {
         rmp::encode::write_str(&mut buf, self.operation)?;
         rmpv::encode::write_value_ref(&mut buf, &self.field_name)?;
         match &self.args {
-            Args::None => {}
             Args::One(x) => {
                 rmpv::encode::write_value_ref(&mut buf, x)?;
             }
@@ -155,7 +156,6 @@ impl Tuple for DmoOperation<'_> {
 
 #[derive(Debug)]
 enum Args<'a> {
-    None,
     One(rmpv::ValueRef<'a>),
     Three(rmpv::ValueRef<'a>, rmpv::ValueRef<'a>, rmpv::ValueRef<'a>),
 }
@@ -188,5 +188,19 @@ mod tests {
         // fixarray(3), fixstr(1), operator
         assert_eq!(&insert[..3], &[0x93, 0xa1, b'!']);
         assert_ne!(insert, encode(&DmoOperation::or(1u32, 42)));
+    }
+
+    #[test]
+    fn delete_encodes_field_and_count() {
+        // fixarray(3), fixstr(1) '#', field 2, count 1
+        assert_eq!(
+            encode(&DmoOperation::delete(2u32, 1)),
+            [0x93, 0xa1, b'#', 0x02, 0x01]
+        );
+        // The third element is the count, not a constant.
+        assert_eq!(
+            encode(&DmoOperation::delete(2u32, 2)),
+            [0x93, 0xa1, b'#', 0x02, 0x02]
+        );
     }
 }

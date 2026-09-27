@@ -248,12 +248,12 @@ impl<E: Executor> Space<E> {
 
     /// Call `upsert` on current space.
     ///
-    /// For details see [`ExecutorExt::upsert`].
+    /// For details see [`ExecutorExt::upsert`]. UPSERT returns nothing.
     /// # Errors
     ///
     /// Returns an error if the request failed to reach Tarantool or
     /// Tarantool responded with an error.
-    pub async fn upsert<T, O>(&self, tuple: T, ops: O) -> Result<DmoResponse>
+    pub async fn upsert<T, O>(&self, tuple: T, ops: O) -> Result<()>
     where
         T: Tuple + Send,
         O: Tuple + Send,

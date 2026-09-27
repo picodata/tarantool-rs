@@ -17,12 +17,10 @@ async fn main() -> Result<(), anyhow::Error> {
             .select::<(i64, String), _>(None, None, Some(IteratorType::All), ())
             .await?
     );
-    info!(
-        "UPSERT: {:?}",
-        space
-            .upsert((0, "Name"), DmoOperation::string_splice("name", 2, 2, "!!"),)
-            .await?
-    );
+    space
+        .upsert((0, "Name"), DmoOperation::string_splice("name", 2, 2, "!!"))
+        .await?;
+    info!("UPSERT done");
     info!(
         "UPDATE: {:?}",
         space

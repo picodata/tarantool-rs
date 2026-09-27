@@ -116,14 +116,17 @@ pub trait ExecutorExt: Executor {
     }
 
     /// Update or insert tuple.
-    async fn upsert<T, O>(&self, space_id: u32, tuple: T, ops: O) -> Result<DmoResponse>
+    ///
+    /// UPSERT returns nothing: the server answers with no tuple (an empty DATA
+    /// array).
+    async fn upsert<T, O>(&self, space_id: u32, tuple: T, ops: O) -> Result<()>
     where
         T: Tuple + Send,
         O: Tuple + Send,
     {
-        Ok(DmoResponse(
-            self.send_request(Upsert::new(space_id, ops, tuple)).await?,
-        ))
+        self.send_request(Upsert::new(space_id, ops, tuple))
+            .await
+            .map(drop)
     }
 
     /// Insert a tuple into a space. If a tuple with the same primary key already exists,

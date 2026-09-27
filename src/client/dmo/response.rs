@@ -5,7 +5,7 @@ use crate::{errors::DecodingError, utils::extract_iproto_data};
 
 // TODO: unify with call_response.rs
 
-/// Tuple, returned from all data-manipulation operations (insert, update, upsert, replace, delete).
+/// Tuple, returned from data-manipulation operations (insert, update, replace, delete).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DmoResponse(pub(crate) rmpv::Value);
 

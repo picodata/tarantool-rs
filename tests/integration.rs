@@ -451,8 +451,9 @@ async fn upsert_on_existing_tuple_applies_operations() -> Result<(), anyhow::Err
         .expect("Space 'ds9_crew' found");
 
     // A REPLACE would store this tuple verbatim. An UPSERT on an existing key
-    // must ignore the tuple and apply the operations instead.
-    let _ = space
+    // must ignore the tuple and apply the operations instead. It returns
+    // nothing, which the `()` binding pins.
+    let () = space
         .upsert(
             (1u32, "Replaced", "Replaced", "Replaced"),
             (DmoOperation::assign(2u32, "Captain"),),
@@ -498,6 +499,38 @@ async fn dmo_insert_operation_inserts_a_field() -> Result<(), anyhow::Error> {
             "Commander".into(),
             "Commanding officer".into()
         )
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn dmo_delete_operation_removes_fields() -> Result<(), anyhow::Error> {
+    let container = TarantoolTestContainer::new_with_test_data();
+    let conn = container.create_conn().await?;
+    let space = conn
+        .space("ds9_crew")
+        .await?
+        .expect("Space 'ds9_crew' found");
+
+    // Two updates: one request may not touch the same field twice. Deleting
+    // the inserted field keeps the tuple within the space format.
+    let _ = space
+        .update((1u32,), (DmoOperation::insert(1u32, "Emissary"),))
+        .await?;
+    let restored: CrewMember = space
+        .update((1u32,), (DmoOperation::delete(1u32, 1),))
+        .await?
+        .decode()?;
+    assert_eq!(
+        restored,
+        CrewMember {
+            id: 1,
+            name: "Benjamin Sisko".into(),
+            rank: "Commander".into(),
+            occupation: "Commanding officer".into()
+        }
     );
 
     Ok(())
