@@ -3,8 +3,8 @@ pub use testcontainers;
 use std::{borrow::Cow, collections::HashMap};
 
 use testcontainers::{
-    Container, Image, ImageExt,
-    core::{ContainerPort, IntoContainerPort, Mount, WaitFor},
+    Container, ContainerRequest, Image,
+    core::{ContainerPort, IntoContainerPort, WaitFor},
     runners::SyncRunner,
 };
 
@@ -15,12 +15,12 @@ fn image_tag() -> String {
     std::env::var("TARANTOOL_IMAGE_TAG").unwrap_or(DEFAULT_IMAGE_TAG.into())
 }
 
+/// Tarantool image with the MVCC engine on. Mounts and the command line come
+/// from `ImageExt` (`with_mount`, `with_cmd`).
 #[derive(Clone, Debug)]
 pub struct TarantoolImage {
     tag: String,
     env_vars: HashMap<String, String>,
-    mounts: Vec<Mount>,
-    cmd: Vec<String>,
 }
 
 impl Default for TarantoolImage {
@@ -28,8 +28,6 @@ impl Default for TarantoolImage {
         Self {
             tag: image_tag(),
             env_vars: HashMap::from([("TT_MEMTX_USE_MVCC_ENGINE".to_owned(), "true".to_owned())]),
-            mounts: Vec::new(),
-            cmd: vec!["tarantool".to_owned()],
         }
     }
 }
@@ -53,12 +51,8 @@ impl Image for TarantoolImage {
         self.env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
-    fn mounts(&self) -> impl IntoIterator<Item = &Mount> {
-        &self.mounts
-    }
-
     fn cmd(&self) -> impl IntoIterator<Item = impl Into<Cow<'_, str>>> {
-        self.cmd.iter().map(String::as_str)
+        ["tarantool"]
     }
 
     fn expose_ports(&self) -> &[ContainerPort] {
@@ -71,25 +65,18 @@ impl TarantoolImage {
         drop(self.env_vars.remove("TT_MEMTX_USE_MVCC_ENGINE"));
         self
     }
-
-    pub fn volume(mut self, host_path: String, container_path: String) -> Self {
-        self.mounts
-            .push(Mount::bind_mount(host_path, container_path));
-        self
-    }
-
-    /// Replace the whole container command line, including the binary:
-    /// pass `"tarantool"` (or another entrypoint) as the first element.
-    pub fn cmd_args(mut self, args: impl IntoIterator<Item = String>) -> Self {
-        self.cmd = args.into_iter().collect();
-        self
-    }
 }
 
-// testcontainers' blocking API drives its own tokio runtime under the hood,
-// and tokio panics when a runtime is entered from a worker thread of another
-// runtime (as happens in #[tokio::test]). Every blocking testcontainers call
-// is therefore pushed onto a dedicated OS thread.
+/// Run `f` on a helper OS thread and wait for it.
+///
+/// testcontainers' blocking API drives its own tokio runtime under the hood,
+/// and tokio panics when a runtime is entered from a worker thread of another
+/// runtime (as happens in #[tokio::test]). Every blocking testcontainers call
+/// is therefore pushed onto a dedicated OS thread.
+fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> std::thread::Result<T> {
+    std::thread::scope(|scope| scope.spawn(f).join())
+}
+
 pub struct TarantoolTestContainer {
     container: Option<Container<TarantoolImage>>,
 }
@@ -101,9 +88,11 @@ impl Default for TarantoolTestContainer {
 }
 
 impl TarantoolTestContainer {
-    pub fn from_image(image: TarantoolImage) -> Self {
-        let container = std::thread::spawn(move || image.start())
-            .join()
+    /// Start a container from `image`: a `TarantoolImage`, or a request built
+    /// from one with `ImageExt`, for example with a mount, a command or a
+    /// fixed host port (`with_mapped_port`).
+    pub fn from_image(image: impl Into<ContainerRequest<TarantoolImage>> + Send + 'static) -> Self {
+        let container = off_runtime(move || image.start())
             .expect("tarantool container start thread panicked")
             .expect("failed to start tarantool test container");
         Self {
@@ -113,13 +102,9 @@ impl TarantoolTestContainer {
 
     pub fn connect_port(&self) -> u16 {
         let container = self.container();
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| container.get_host_port_ipv4(3301.tcp()))
-                .join()
-        })
-        .expect("tarantool container port thread panicked")
-        .expect("failed to get mapped port 3301 of tarantool test container")
+        off_runtime(|| container.get_host_port_ipv4(3301.tcp()))
+            .expect("tarantool container port thread panicked")
+            .expect("failed to get mapped port 3301 of tarantool test container")
     }
 
     fn container(&self) -> &Container<TarantoolImage> {
@@ -128,32 +113,14 @@ impl TarantoolTestContainer {
             .expect("container is present until drop")
     }
 
-    /// Start a container whose port 3301 is published on a fixed host port,
-    /// so the address stays valid across [`Self::restart`] (Docker may pick a
-    /// new ephemeral port when a container with a dynamic mapping restarts).
-    pub fn from_image_with_host_port(image: TarantoolImage, host_port: u16) -> Self {
-        let container =
-            std::thread::spawn(move || image.with_mapped_port(host_port, 3301.tcp()).start())
-                .join()
-                .expect("tarantool container start thread panicked")
-                .expect("failed to start tarantool test container");
-        Self {
-            container: Some(container),
-        }
-    }
-
     /// Stop the container and start it again. The server process restarts,
     /// so every client connection to it is dropped. Returns once Docker has
     /// started the container, not once Tarantool listens again.
     pub fn restart(&self) {
         let container = self.container();
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    container.stop()?;
-                    container.start()
-                })
-                .join()
+        off_runtime(|| {
+            container.stop()?;
+            container.start()
         })
         .expect("tarantool container restart thread panicked")
         .expect("failed to restart tarantool test container");
@@ -163,7 +130,7 @@ impl TarantoolTestContainer {
 impl Drop for TarantoolTestContainer {
     fn drop(&mut self) {
         if let Some(container) = self.container.take() {
-            let _ = std::thread::spawn(move || drop(container)).join();
+            let _ = off_runtime(move || drop(container));
         }
     }
 }
