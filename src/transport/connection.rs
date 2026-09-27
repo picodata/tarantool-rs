@@ -493,7 +493,7 @@ impl Connection {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+    use tokio::{io::AsyncWriteExt, net::TcpListener, sync::Notify, time::timeout};
     use tokio_util::codec::Encoder;
     use tracing_test::traced_test;
 
@@ -507,13 +507,9 @@ pub(super) mod tests {
     use parking_lot::Mutex;
 
     use rmpv::Value;
-    use tokio::sync::oneshot;
 
     use crate::codec::consts::{RequestType, keys, response_codes::ERROR_RANGE_START};
-    use crate::codec::{
-        request::{Eval, Ping},
-        tests::greeting_with_salt,
-    };
+    use crate::codec::{request::Ping, tests::greeting_with_salt};
     use crate::transport::DispatcherSender;
 
     /// Greeting whose salt is 32 zero bytes (base64: 43 'A' and one '=').
@@ -591,7 +587,7 @@ pub(super) mod tests {
 
     /// OK body for a request of `request_type`: an `IPROTO_ID` body for ID
     /// requests, an empty map for the rest.
-    pub(crate) fn ok_body_for(request_type: u8) -> Value {
+    fn ok_body_for(request_type: u8) -> Value {
         if request_type == RequestType::Id as u8 {
             id_response_body()
         } else {
@@ -604,27 +600,40 @@ pub(super) mod tests {
         sync
     }
 
-    /// Fake server: writes the greeting, then answers every request with an
-    /// OK response (an `IPROTO_ID` one for ID requests). `sync_for` maps the
-    /// request's `(request_type, sync)` to the sync put into the response, so
-    /// tests can inject a mismatch.
+    /// Serve one connection of a fake server: write the greeting, then answer
+    /// each request with an OK response (an `IPROTO_ID` one for ID requests)
+    /// until the client closes the socket. `on_request` gets the request's
+    /// `(request_type, sync)` and returns the sync to answer with, or `None`
+    /// to leave the request unanswered.
+    pub(crate) async fn serve_connection(
+        mut sock: TcpStream,
+        mut on_request: impl FnMut(u8, u64) -> Option<u64>,
+    ) {
+        if sock.write_all(&fake_greeting()).await.is_err() {
+            return;
+        }
+        while let Some((request_type, sync)) = read_request(&mut sock).await {
+            let Some(sync) = on_request(request_type, sync) else {
+                continue;
+            };
+            let response = ok_response(sync, &ok_body_for(request_type));
+            if sock.write_all(&response).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Fake server: serves every connection with [`serve_connection`].
+    /// `sync_for` maps the request's `(request_type, sync)` to the sync put
+    /// into the response, so tests can inject a mismatch.
     pub(crate) async fn spawn_fake_server(sync_for: fn(u8, u64) -> u64) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    if sock.write_all(&fake_greeting()).await.is_err() {
-                        return;
-                    }
-                    while let Some((request_type, sync)) = read_request(&mut sock).await {
-                        let response =
-                            ok_response(sync_for(request_type, sync), &ok_body_for(request_type));
-                        if sock.write_all(&response).await.is_err() {
-                            return;
-                        }
-                    }
-                });
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(serve_connection(sock, move |request_type, sync| {
+                    Some(sync_for(request_type, sync))
+                }));
             }
         });
         addr
@@ -727,6 +736,56 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn auth_error_wins_when_the_id_error_comes_first() {
+        // The reverse order tells "AUTH wins" from "the first error wins".
+        let addr = spawn_handshake_server(2, |requests| {
+            let mut frames = replies(requests, &[RequestType::Auth, RequestType::Id]);
+            frames.reverse();
+            frames
+        })
+        .await;
+        assert!(matches!(handshake_as_user(addr).await, Err(Error::Auth(_))));
+    }
+
+    /// OK reply to the handshake request of `request_type`.
+    fn reply_to(requests: &[(u8, u64)], request_type: RequestType) -> Vec<u8> {
+        let &(_, sync) = requests
+            .iter()
+            .find(|&&(x, _)| x == request_type as u8)
+            .expect("the client sent no such handshake request");
+        ok_response(sync, &ok_body_for(request_type as u8))
+    }
+
+    #[tokio::test]
+    async fn second_auth_reply_fails_the_handshake() {
+        let addr = spawn_handshake_server(2, |requests| {
+            let auth = reply_to(requests, RequestType::Auth);
+            vec![auth.clone(), auth, reply_to(requests, RequestType::Id)]
+        })
+        .await;
+        assert!(matches!(
+            handshake_as_user(addr).await,
+            Err(Error::Other(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn wrong_sync_after_an_early_id_reply_fails_the_handshake() {
+        let addr = spawn_handshake_server(2, |requests| {
+            // The ID reply comes first, then a reply that is not AUTH's.
+            vec![
+                reply_to(requests, RequestType::Id),
+                ok_response(42, &Value::Map(Vec::new())),
+            ]
+        })
+        .await;
+        assert!(matches!(
+            handshake_as_user(addr).await,
+            Err(Error::Other(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn small_threshold_does_not_panic() {
         let addr = spawn_fake_server(echo_sync).await;
         let conn = Connection::new_inner(addr, None, None, 50).await;
@@ -769,9 +828,13 @@ pub(super) mod tests {
     /// Wait until the writer task has ended on its own, so that `run` joins
     /// its outcome instead of aborting it first.
     async fn writer_ended(conn: &Connection) {
-        while !conn.writer_task_handle.is_finished() {
-            tokio::task::yield_now().await;
-        }
+        timeout(Duration::from_secs(1), async {
+            while !conn.writer_task_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the writer task did not end within 1 s");
     }
 
     #[tokio::test]
@@ -805,6 +868,44 @@ pub(super) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn writer_error_reaches_in_flight_callers_and_reports_a_loss() {
+        // The writer takes request 1, then fails with an I/O error.
+        let (taken_tx, taken_rx) = oneshot::channel();
+        let (conn, _server) = connection_pair(|mut writer_rx, _write| async move {
+            let request = writer_rx
+                .recv()
+                .await
+                .expect("request 1 reaches the writer");
+            let _ = taken_tx.send(request.sync);
+            Err(CodecEncodeError::Io(io::Error::other("write failed")))
+        })
+        .await;
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+        let (mut client_liveness, client_handle) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
+
+        let script = async move {
+            client_tx
+                .send(client_request(ping_with_sync(1), None, tx))
+                .await
+                .unwrap();
+            assert_eq!(taken_rx.await, Ok(1));
+            // The clients go away after the write failed: that alone would be
+            // a clean stop.
+            drop(client_handle);
+            (client_tx, rx.await)
+        };
+        let (run_res, (_client_tx, response)) = tokio::join!(
+            conn.run(&mut client_rx, &mut cancel_rx, &mut client_liveness, 0),
+            script
+        );
+
+        assert!(run_res.is_err(), "a failed writer made a clean shutdown");
+        assert!(matches!(response, Ok(Err(Error::Io(_)))), "{response:?}");
+    }
+
     /// In-memory write half that counts write and flush calls and keeps the
     /// bytes it was given.
     #[derive(Clone, Default)]
@@ -832,6 +933,32 @@ pub(super) mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    /// In-memory write half whose writes never complete, like a socket whose
+    /// peer never reads. It notifies `write_started` once a write begins.
+    #[derive(Clone, Default)]
+    struct StuckWriter {
+        write_started: Arc<Notify>,
+    }
+
+    impl AsyncWrite for StuckWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.write_started.notify_one();
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
         }
     }
 
@@ -901,28 +1028,28 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn blocked_writer_stops_promptly_on_teardown() {
-        // The peer never reads, so 32 requests of 1 MiB fill the socket
-        // buffers and block the writer inside a write.
-        let (conn, mut server) = connection_pair(real_writer).await;
-        let (client_tx, mut client_rx) = mpsc::channel(64);
+        // The writer blocks inside its first write, as it does when the peer
+        // never reads, whatever the host's socket buffer sizes.
+        let writer = StuckWriter::default();
+        let (conn, mut server) = connection_pair({
+            let writer = writer.clone();
+            move |rx, _write| writer_task(rx, FramedWrite::new(writer, ClientCodec::default()))
+        })
+        .await;
+        let (client_tx, mut client_rx) = mpsc::channel(4);
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, _client_handle) = oneshot::channel();
         let generation = 0;
-        let expr = "x".repeat(1024 * 1024);
-        let mut receivers = Vec::new();
-        for sync in 1..=32 {
-            let mut request = EncodedRequest::new(&Eval::new(&expr, ()), None).unwrap();
-            *request.sync_mut() = sync;
-            let (tx, rx) = oneshot::channel();
-            client_tx
-                .send(client_request(request, None, tx))
-                .await
-                .unwrap();
-            receivers.push(rx);
-        }
+        let (tx, _rx) = oneshot::channel();
+        client_tx
+            .send(client_request(ping_with_sync(1), None, tx))
+            .await
+            .unwrap();
 
         let script = async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            timeout(Duration::from_secs(1), writer.write_started.notified())
+                .await
+                .expect("the writer never started a write");
             // End of stream for the client's reader: `run` tears down while
             // the writer is still blocked.
             server.shutdown().await.unwrap();
@@ -1284,7 +1411,8 @@ pub(super) mod tests {
 
             // The caller of request 1 gives up, and its late response comes.
             drop(first);
-            // Lets the cancel reach `run` before the late response, in any `join!` poll order.
+            // Lets the cancel reach `run` before the late response, in any
+            // `join!` poll order.
             tokio::time::sleep(Duration::from_millis(50)).await;
             server
                 .write_all(&ok_response(1, &Value::Map(Vec::new())))

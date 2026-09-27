@@ -422,10 +422,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use parking_lot::Mutex;
-    use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle, time::timeout};
+    use tokio::{
+        io::AsyncWriteExt, net::TcpListener, sync::Notify, task::JoinHandle, time::timeout,
+    };
 
     use super::super::connection::tests::{
-        echo_sync, fake_greeting, id_response_body, ok_body_for, ok_response, read_request,
+        echo_sync, fake_greeting, id_response_body, ok_response, read_request, serve_connection,
         spawn_fake_server,
     };
     use crate::{
@@ -457,12 +459,16 @@ mod tests {
     }
 
     /// Fake server that completes the handshake of every connection, then
-    /// holds the socket and never reads from it again.
-    async fn spawn_non_reading_server() -> String {
+    /// holds the socket and never reads from it again. The returned `Notify`
+    /// is notified once a handshake is answered.
+    async fn spawn_non_reading_server() -> (String, Arc<Notify>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let handshaken = Arc::new(Notify::new());
+        let notify = handshaken.clone();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
+                let notify = notify.clone();
                 tokio::spawn(async move {
                     sock.write_all(&fake_greeting()).await.unwrap();
                     let (request_type, sync) = read_request(&mut sock).await.unwrap();
@@ -470,16 +476,17 @@ mod tests {
                     sock.write_all(&ok_response(sync, &id_response_body()))
                         .await
                         .unwrap();
+                    notify.notify_one();
                     std::future::pending::<()>().await;
                 });
             }
         });
-        addr
+        (addr, handshaken)
     }
 
     #[tokio::test]
     async fn dispatcher_exits_when_last_handle_drops_while_the_peer_does_not_read() {
-        let addr = spawn_non_reading_server().await;
+        let (addr, handshaken) = spawn_non_reading_server().await;
         let (dispatcher, sender) = dispatcher_for(
             addr,
             Some(ReconnectInterval::fixed(Duration::from_millis(10))),
@@ -499,7 +506,27 @@ mod tests {
                 sender.requests().send(request, None).await
             }));
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The gated state: the writer is blocked, a hand-off to it is
+        // pending, and `run` no longer reads the dispatcher queue, which then
+        // stays full. The queue also fills while the dispatcher connects, so
+        // the wait starts after the handshake.
+        timeout(Duration::from_secs(1), handshaken.notified())
+            .await
+            .expect("no handshake within 1 s");
+        let queue = &sender.requests().requests;
+        timeout(Duration::from_secs(5), async {
+            let mut full_checks = 0;
+            while full_checks < 10 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                full_checks = if queue.capacity() == 0 {
+                    full_checks + 1
+                } else {
+                    0
+                };
+            }
+        })
+        .await
+        .expect("the dispatcher queue never stayed full for 100 ms");
 
         // The application drops every handle, its pending requests included.
         for request in &requests {
@@ -585,28 +612,21 @@ mod tests {
             let seen = server.seen.clone();
             let live = server.live.clone();
             tokio::spawn(async move {
-                while let Ok((mut sock, _)) = listener.accept().await {
+                while let Ok((sock, _)) = listener.accept().await {
                     if !up.load(Ordering::SeqCst) {
                         attempts_while_down.fetch_add(1, Ordering::SeqCst);
                         drop(sock);
                         continue;
                     }
                     let seen = seen.clone();
-                    live.lock().push(tokio::spawn(async move {
-                        if sock.write_all(&fake_greeting()).await.is_err() {
-                            return;
-                        }
-                        while let Some((request_type, sync)) = read_request(&mut sock).await {
+                    live.lock().push(tokio::spawn(serve_connection(
+                        sock,
+                        move |request_type, sync| {
                             seen.lock().push(request_type);
-                            if silent.iter().any(|x| *x as u8 == request_type) {
-                                continue;
-                            }
-                            let response = ok_response(sync, &ok_body_for(request_type));
-                            if sock.write_all(&response).await.is_err() {
-                                return;
-                            }
-                        }
-                    }));
+                            let silent = silent.iter().any(|x| *x as u8 == request_type);
+                            (!silent).then_some(sync)
+                        },
+                    )));
                 }
             });
             server
