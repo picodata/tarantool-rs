@@ -62,6 +62,25 @@ async fn auth_err() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[traced_test]
+async fn authenticated_user_commits_a_transaction_on_a_stream() -> Result<(), anyhow::Error> {
+    let container = TarantoolTestContainer::new_with_test_data();
+
+    // AUTH and ID share one round trip, and the server may handle ID first.
+    let conn = Connection::builder()
+        .auth("Sisko", Some("A-4-7-1"))
+        .build(format!("127.0.0.1:{}", container.connect_port()))
+        .await?;
+    // BEGIN, the request inside the transaction and COMMIT all carry the
+    // transaction's stream id; none of them needs an object privilege.
+    let tx = conn.transaction().await?;
+    tx.ping().await?;
+    tx.commit().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
 async fn eval() -> Result<(), anyhow::Error> {
     let container = TarantoolTestContainer::new_with_test_data();
 
@@ -313,11 +332,15 @@ async fn restart_mid_transaction_fails_the_stale_transaction() -> Result<(), any
 
 /// Ping `probe` until it fails with `ConnectionReset`, which proves that the
 /// client observed the loss of the connection the probe was created on.
+///
+/// Each ping is bounded: one sent just before the loss was observed waits in
+/// the queue until the client reconnects, which it cannot do while the server
+/// is down.
 async fn wait_until_reset(probe: &Stream, limit: Duration) {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
-        match probe.ping().await {
-            Err(Error::ConnectionReset) => return,
+        match tokio::time::timeout(Duration::from_secs(1), probe.ping()).await {
+            Ok(Err(Error::ConnectionReset)) => return,
             other => {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -329,11 +352,13 @@ async fn wait_until_reset(probe: &Stream, limit: Duration) {
     }
 }
 
-#[tokio::test]
+// Multi-thread: the dispatcher keeps running on the worker threads while
+// `stop` and `start` block the test's thread.
+#[tokio::test(flavor = "multi_thread")]
 #[traced_test]
 async fn transaction_created_during_outage_commits_after_reconnect() -> Result<(), anyhow::Error> {
     let container = TarantoolTestContainer::new_restartable();
-    // Long enough for BEGIN to wait out the restart in the queue.
+    // Long enough for BEGIN to wait out the outage in the queue.
     let conn = Connection::builder()
         .timeout(Duration::from_secs(30))
         .build(format!("127.0.0.1:{}", container.connect_port()))
@@ -341,11 +366,19 @@ async fn transaction_created_during_outage_commits_after_reconnect() -> Result<(
     let probe = conn.stream();
     probe.ping().await?;
 
-    container.restart();
+    container.stop();
+    // The loss is observed while the server is still down.
     wait_until_reset(&probe, Duration::from_secs(60)).await;
 
-    // Begun after the loss was observed: it belongs to the next connection.
-    let tx = conn.transaction().await?;
+    // Begun during the outage, it belongs to the next connection. One poll
+    // creates its stream and queues its BEGIN before the server is back.
+    let begin_conn = conn.clone();
+    let mut begin = Box::pin(async move { begin_conn.transaction().await });
+    assert!(futures::poll!(begin.as_mut()).is_pending());
+    let begin = tokio::spawn(begin);
+    container.start();
+
+    let tx = begin.await??;
     let space = tx
         .space("reconnect")
         .await?
@@ -416,11 +449,13 @@ async fn prepared_statement_after_restart_returns_wrong_query_id() -> Result<(),
     Ok(())
 }
 
-#[tokio::test]
+// Multi-thread: the dispatcher keeps running on the worker threads while
+// `stop` and `start` block the test's thread.
+#[tokio::test(flavor = "multi_thread")]
 #[traced_test]
 async fn cached_sql_during_outage_uses_the_new_session() -> Result<(), anyhow::Error> {
     let container = TarantoolTestContainer::new_restartable();
-    // Long enough for the PREPARE to wait out the restart in the queue.
+    // Long enough for the PREPARE to wait out the outage in the queue.
     let conn = Connection::builder()
         .timeout(Duration::from_secs(30))
         .build(format!("127.0.0.1:{}", container.connect_port()))
@@ -430,12 +465,20 @@ async fn cached_sql_during_outage_uses_the_new_session() -> Result<(), anyhow::E
     let probe = conn.stream();
     probe.ping().await?;
 
-    container.restart();
+    container.stop();
+    // The loss is observed while the server is still down.
     wait_until_reset(&probe, Duration::from_secs(60)).await;
 
-    // The loss was observed, so the lookup misses and prepares on the new
-    // session instead of sending the old id.
-    let _ = conn.execute_sql("SELECT ?", (1,)).await?;
+    // Called during the outage, after the loss was observed: the lookup
+    // misses, so the call prepares on the new session instead of sending the
+    // old id there. One poll queues its PREPARE before the server is back.
+    let sql_conn = conn.clone();
+    let mut call = Box::pin(async move { sql_conn.execute_sql("SELECT ?", (1,)).await });
+    assert!(futures::poll!(call.as_mut()).is_pending());
+    let call = tokio::spawn(call);
+    container.start();
+
+    let _ = call.await??;
 
     Ok(())
 }

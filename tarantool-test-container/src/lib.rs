@@ -113,17 +113,31 @@ impl TarantoolTestContainer {
             .expect("container is present until drop")
     }
 
+    /// Stop the container. The server process exits, so every client
+    /// connection to it is dropped, and connecting fails until
+    /// [`Self::start`].
+    pub fn stop(&self) {
+        let container = self.container();
+        off_runtime(|| container.stop())
+            .expect("tarantool container stop thread panicked")
+            .expect("failed to stop tarantool test container");
+    }
+
+    /// Start the stopped container again. Returns once Docker has started
+    /// the container, not once Tarantool listens again.
+    pub fn start(&self) {
+        let container = self.container();
+        off_runtime(|| container.start())
+            .expect("tarantool container start thread panicked")
+            .expect("failed to start tarantool test container");
+    }
+
     /// Stop the container and start it again. The server process restarts,
     /// so every client connection to it is dropped. Returns once Docker has
     /// started the container, not once Tarantool listens again.
     pub fn restart(&self) {
-        let container = self.container();
-        off_runtime(|| {
-            container.stop()?;
-            container.start()
-        })
-        .expect("tarantool container restart thread panicked")
-        .expect("failed to restart tarantool test container");
+        self.stop();
+        self.start();
     }
 }
 
