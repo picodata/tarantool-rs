@@ -238,7 +238,7 @@ where
 }
 
 impl OwnedIndex<Transaction> {
-    /// Commit inner tranasction.
+    /// Commit inner transaction.
     ///
     /// For details see [`Transaction::commit`].
     /// # Errors
@@ -258,7 +258,7 @@ impl OwnedIndex<Transaction> {
         self.executor.commit().await
     }
 
-    /// Rollback inner tranasction.
+    /// Rollback inner transaction.
     ///
     /// For details see [`Transaction::rollback`].
     /// # Errors

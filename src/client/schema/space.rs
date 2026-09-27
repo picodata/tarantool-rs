@@ -293,7 +293,7 @@ impl<E: Executor> Space<E> {
 }
 
 impl Space<Transaction> {
-    /// Commit inner tranasction.
+    /// Commit inner transaction.
     ///
     /// For details see [`Transaction::commit`].
     /// # Errors
@@ -311,7 +311,7 @@ impl Space<Transaction> {
         self.executor.commit().await
     }
 
-    /// Rollback inner tranasction.
+    /// Rollback inner transaction.
     ///
     /// For details see [`Transaction::rollback`].
     /// # Errors

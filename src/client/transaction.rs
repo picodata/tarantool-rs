@@ -17,7 +17,7 @@ use crate::{
 
 /// Started transaction ([docs](https://www.tarantool.io/en/doc/latest/dev_guide/internals/box_protocol/#binary-protocol-streams)).
 ///
-/// If tranasction have a timeout and no requests made for that time, tranasction is automatically
+/// If transaction have a timeout and no requests made for that time, transaction is automatically
 /// rolled back.
 ///
 /// On drop the transaction is rolled back, unless the server answered its
@@ -50,13 +50,13 @@ impl Transaction {
         transaction_isolation_level: TransactionIsolationLevel,
         timeout_secs: Option<f64>,
     ) -> Result<()> {
-        debug!("Beginning tranasction on stream {}", self.stream.id);
+        debug!("Beginning transaction on stream {}", self.stream.id);
         self.send_request(Begin::new(timeout_secs, transaction_isolation_level))
             .await
             .map(drop)
     }
 
-    /// Commit tranasction.
+    /// Commit transaction.
     /// # Errors
     ///
     /// Every failure returns a [`TransactionError`] with the transaction in
@@ -78,11 +78,11 @@ impl Transaction {
     /// After [`Error::ConnectionReset`] the transaction is already gone with
     /// the connection it began on.
     pub async fn commit(self) -> StdResult<(), TransactionError> {
-        debug!("Commiting tranasction on stream {}", self.stream.id);
+        debug!("Committing transaction on stream {}", self.stream.id);
         self.finish(Commit::default()).await
     }
 
-    /// Rollback tranasction.
+    /// Rollback transaction.
     /// # Errors
     ///
     /// Every failure returns a [`TransactionError`] with the transaction in
@@ -102,7 +102,7 @@ impl Transaction {
     /// After [`Error::ConnectionReset`] the transaction is already gone with
     /// the connection it began on.
     pub async fn rollback(self) -> StdResult<(), TransactionError> {
-        debug!("Rolling back tranasction on stream {}", self.stream.id);
+        debug!("Rolling back transaction on stream {}", self.stream.id);
         self.finish(Rollback::default()).await
     }
 
@@ -143,7 +143,7 @@ impl Drop for Transaction {
             return;
         }
         debug!(
-            "Rolling back tranasction on stream {} (on drop)",
+            "Rolling back transaction on stream {} (on drop)",
             self.stream.id
         );
         self.stream.conn.send_request_sync_and_forget(
