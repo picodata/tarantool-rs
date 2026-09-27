@@ -41,3 +41,17 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  minimal-versions:
+    name: Minimal versions
+    runs-on: ubuntu-latest
+    # A too-low floor can hang rustc instead of failing, and GitHub's default limit is 6 hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Install the nightly pinned in the justfile
+        run: just --evaluate nightly | xargs rustup toolchain install --profile minimal
+      - run: just minimal-versions
