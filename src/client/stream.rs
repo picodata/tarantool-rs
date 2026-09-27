@@ -105,6 +105,10 @@ impl Executor for Stream {
     }
 
     async fn get_cached_sql_statement_id(&self, statement: &str) -> Option<u64> {
+        // A lookup may send a PREPARE. Without an id, `execute_sql` sends its
+        // text through `send_encoded_request`, which fails with
+        // `ConnectionReset` unsent.
+        self.check_generation().ok()?;
         self.conn.get_cached_sql_statement_id(statement).await
     }
 

@@ -684,6 +684,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transaction_finished_by_a_server_error_sends_no_sql() {
+        let (tx, rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+        let seen = spawn_fake_dispatcher(rx, |request_type| {
+            if request_type == RequestType::Commit as u8 {
+                reject_commit_and_rollback(request_type)
+            } else {
+                prepare_ok_body(request_type)
+            }
+        });
+
+        let transaction = conn.transaction().await.unwrap();
+        let err = transaction.commit().await.unwrap_err();
+        assert!(matches!(err.error, Error::Response(_)), "{:?}", err.error);
+
+        // Neither call may reach the statement cache, whose lookup would
+        // send a PREPARE for a transaction that can do nothing.
+        let res = err.transaction.execute_sql("SELECT 1", ()).await;
+        assert!(matches!(res, Err(Error::Other(_))), "{res:?}");
+        let res = err.transaction.prepare_sql("SELECT 1").await;
+        assert!(matches!(res, Err(Error::Other(_))), "{res:?}");
+        drop(err);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            kinds(&seen),
+            vec![(RequestType::Begin as u8, Some(1)), COMMIT]
+        );
+    }
+
+    #[tokio::test]
     async fn requests_carry_client_assigned_syncs() {
         let (tx, rx) = mpsc::channel(8);
         let conn = test_connection(tx, Arc::default(), None);
@@ -837,6 +867,42 @@ mod tests {
         assert!(matches!(res, Err(Error::ConnectionReset)), "{res:?}");
         drop(transaction);
         // Give a drop-time rollback, if any, the chance to reach the dispatcher.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(kinds(&seen), vec![(RequestType::Begin as u8, Some(1))]);
+    }
+
+    #[tokio::test]
+    async fn stale_stream_sends_no_sql() {
+        let (tx, rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let conn = test_connection(tx, generation.clone(), None);
+        let seen = spawn_fake_dispatcher(rx, prepare_ok_body);
+        let stream = conn.stream();
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        // The cache lookup would send a PREPARE on the new session.
+        let res = stream.execute_sql("SELECT 1", ()).await;
+        assert!(matches!(res, Err(Error::ConnectionReset)), "{res:?}");
+        let res = stream.prepare_sql("SELECT 1").await;
+        assert!(matches!(res, Err(Error::ConnectionReset)), "{res:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(kinds(&seen), vec![]);
+    }
+
+    #[tokio::test]
+    async fn stale_transaction_sends_no_sql() {
+        let (tx, rx) = mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(0));
+        let conn = test_connection(tx, generation.clone(), None);
+        let seen = spawn_fake_dispatcher(rx, prepare_ok_body);
+        let transaction = conn.transaction().await.unwrap();
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        let res = transaction.execute_sql("SELECT 1", ()).await;
+        assert!(matches!(res, Err(Error::ConnectionReset)), "{res:?}");
+        let res = transaction.prepare_sql("SELECT 1").await;
+        assert!(matches!(res, Err(Error::ConnectionReset)), "{res:?}");
+        drop(transaction);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(kinds(&seen), vec![(RequestType::Begin as u8, Some(1))]);
     }

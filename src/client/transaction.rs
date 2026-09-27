@@ -183,6 +183,11 @@ impl Executor for Transaction {
     }
 
     async fn get_cached_sql_statement_id(&self, statement: &str) -> Option<u64> {
+        // A lookup may send a PREPARE. Without an id, `execute_sql` sends its
+        // text through `send_encoded_request`, which fails unsent.
+        if self.finished {
+            return None;
+        }
         self.stream.get_cached_sql_statement_id(statement).await
     }
 
