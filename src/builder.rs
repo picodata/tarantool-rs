@@ -4,7 +4,9 @@ use tokio::{net::ToSocketAddrs, sync::Semaphore};
 use tracing::warn;
 
 use crate::{
-    client::Connection, codec::consts::TransactionIsolationLevel, errors::Error,
+    client::Connection,
+    codec::{consts::TransactionIsolationLevel, request::AuthMethod},
+    errors::Error,
     transport::Dispatcher,
 };
 
@@ -79,6 +81,7 @@ impl ReconnectInterval {
 pub struct ConnectionBuilder {
     user: Option<String>,
     password: Option<String>,
+    auth_method: AuthMethod,
     timeout: Option<Duration>,
     transaction_timeout: Option<Duration>,
     transaction_isolation_level: TransactionIsolationLevel,
@@ -93,6 +96,7 @@ impl Default for ConnectionBuilder {
         Self {
             user: None,
             password: None,
+            auth_method: AuthMethod::default(),
             timeout: None,
             transaction_timeout: None,
             transaction_isolation_level: TransactionIsolationLevel::default(),
@@ -122,6 +126,7 @@ impl ConnectionBuilder {
             self.password.as_deref(),
             // Setup is bounded by `connect_timeout`, or by the request timeout
             // when it is unset.
+            self.auth_method,
             self.connect_timeout.or(self.timeout),
             self.reconnect_interval.clone(),
             clamp_threshold(self.internal_simultaneous_requests_threshold),
@@ -145,6 +150,14 @@ impl ConnectionBuilder {
     pub fn auth<'a>(&mut self, user: &str, password: impl Into<Option<&'a str>>) -> &mut Self {
         self.user = Some(user.into());
         self.password = password.into().map(Into::into);
+        self
+    }
+
+    /// Sets authentication type used for this connection.
+    ///
+    /// AUTH message sent upon connecting to server.
+    pub fn auth_method(&mut self, auth_method: AuthMethod) -> &mut Self {
+        self.auth_method = auth_method;
         self
     }
 
