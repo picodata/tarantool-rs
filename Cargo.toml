@@ -19,6 +19,7 @@ bytes = "1"
 fastrand = "2"
 futures = "0.3"
 lru = "0.18.2"
+md-5 = "0.10"
 parking_lot = { version = "0.12", features = ["send_guard"] }
 rmp = "0.8.11"
 rmp-serde = "1"

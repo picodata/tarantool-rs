@@ -3,6 +3,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::errors::EncodingError;
 
+pub use self::auth::AuthMethod;
 pub(crate) use self::{
     auth::Auth, begin::Begin, call::Call, commit::Commit, delete::Delete, eval::Eval,
     execute::Execute, id::Id, insert::Insert, ping::Ping, prepare::Prepare, replace::Replace,
