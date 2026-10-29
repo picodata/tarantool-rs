@@ -19,7 +19,10 @@ use tracing::{debug, error};
 use super::connection::Connection;
 use crate::{
     Error, ReconnectInterval,
-    codec::{request::EncodedRequest, response::Response},
+    codec::{
+        request::{AuthMethod, EncodedRequest},
+        response::Response,
+    },
 };
 
 /// Request from the client together with the channel its response goes to.
@@ -201,6 +204,7 @@ impl Dispatcher {
         addr: A,
         user: Option<&str>,
         password: Option<&str>,
+        auth_method: AuthMethod,
         connect_timeout: Option<Duration>,
         reconnect_interval: Option<ReconnectInterval>,
         internal_simultaneous_requests_threshold: usize,
@@ -220,6 +224,7 @@ impl Dispatcher {
                     addr,
                     user.as_deref(),
                     password.as_deref(),
+                    auth_method,
                     connect_timeout,
                     internal_simultaneous_requests_threshold,
                 )
@@ -443,8 +448,9 @@ mod tests {
         Dispatcher::new(
             Box::new(move || {
                 let addr = addr.clone();
-                Box::pin(async move { Connection::new(addr, None, None, None, 16).await })
-                    as Pin<Box<ConnectDynFuture>>
+                Box::pin(async move {
+                    Connection::new(addr, None, None, AuthMethod::default(), None, 16).await
+                }) as Pin<Box<ConnectDynFuture>>
             }),
             None,
             reconnect_interval,
@@ -684,6 +690,7 @@ mod tests {
             server.addr.clone(),
             None,
             None,
+            AuthMethod::default(),
             None,
             Some(ReconnectInterval::fixed(Duration::from_millis(10))),
             16,
@@ -1000,7 +1007,15 @@ mod tests {
             Box::new(move || {
                 let addr = addr.clone();
                 Box::pin(async move {
-                    Connection::new(addr, None, None, Some(Duration::from_millis(100)), 16).await
+                    Connection::new(
+                        addr,
+                        None,
+                        None,
+                        AuthMethod::default(),
+                        Some(Duration::from_millis(100)),
+                        16,
+                    )
+                    .await
                 }) as Pin<Box<ConnectDynFuture>>
             }),
             None,
