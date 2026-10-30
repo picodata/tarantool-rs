@@ -22,7 +22,7 @@ use super::dispatcher::{ClientRequest, DispatcherResponseSender};
 use crate::{
     codec::{
         ClientCodec, Greeting,
-        request::{Auth, EncodedRequest, Id, Request},
+        request::{Auth, AuthMethod, EncodedRequest, Id, Request},
         response::{Response, ResponseBody},
     },
     errors::{CodecEncodeError, ConnectionError, EncodingError, Error},
@@ -199,6 +199,7 @@ impl Connection {
         addr: A,
         user: Option<&str>,
         password: Option<&str>,
+        auth_method: AuthMethod,
         internal_simultaneous_requests_threshold: usize,
     ) -> Result<Self, Error>
     where
@@ -219,7 +220,12 @@ impl Connection {
         let mut write_stream = FramedWrite::new(write_tcp_stream, ClientCodec::default());
 
         let auth = user
-            .map(|user| handshake_request(&Auth::new(user, password, &greeting.salt), AUTH_SYNC))
+            .map(|user| {
+                handshake_request(
+                    &Auth::new(user, password, &greeting.salt, auth_method),
+                    AUTH_SYNC,
+                )
+            })
             .transpose()?;
         // TODO: add option to disable pre 2.10 features (ID request, streams, watchers)
         // Sent on every connection: a session enables exactly the features the
@@ -267,6 +273,7 @@ impl Connection {
         addr: A,
         user: Option<&str>,
         password: Option<&str>,
+        auth_method: AuthMethod,
         timeout: Option<Duration>,
         internal_simultaneous_requests_threshold: usize,
     ) -> Result<Self, Error>
@@ -280,6 +287,7 @@ impl Connection {
                     addr,
                     user,
                     password,
+                    auth_method,
                     internal_simultaneous_requests_threshold,
                 ),
             )
@@ -291,6 +299,7 @@ impl Connection {
                     addr,
                     user,
                     password,
+                    auth_method,
                     internal_simultaneous_requests_threshold,
                 )
                 .await
@@ -686,7 +695,7 @@ pub(super) mod tests {
     async fn handshake_as_user(addr: String) -> Result<Connection, Error> {
         timeout(
             Duration::from_secs(1),
-            Connection::new_inner(addr, Some("user"), Some("pass"), 500),
+            Connection::new_inner(addr, Some("user"), Some("pass"), AuthMethod::default(), 500),
         )
         .await
         .expect("the client waited for the AUTH reply before sending ID")
@@ -788,7 +797,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn small_threshold_does_not_panic() {
         let addr = spawn_fake_server(echo_sync).await;
-        let conn = Connection::new_inner(addr, None, None, 50).await;
+        let conn = Connection::new_inner(addr, None, None, AuthMethod::default(), 50).await;
         assert!(conn.is_ok());
     }
 
@@ -1081,14 +1090,16 @@ pub(super) mod tests {
     #[tokio::test]
     async fn default_threshold_does_not_panic() {
         let addr = spawn_fake_server(echo_sync).await;
-        let conn = Connection::new_inner(addr, None, None, 500).await;
+        let conn = Connection::new_inner(addr, None, None, AuthMethod::default(), 500).await;
         assert!(conn.is_ok());
     }
 
     #[tokio::test]
     async fn auth_response_with_matching_sync_is_accepted() {
         let addr = spawn_fake_server(echo_sync).await;
-        let conn = Connection::new_inner(addr, Some("user"), Some("pass"), 500).await;
+        let conn =
+            Connection::new_inner(addr, Some("user"), Some("pass"), AuthMethod::default(), 500)
+                .await;
         assert!(conn.is_ok());
     }
 
@@ -1102,7 +1113,9 @@ pub(super) mod tests {
             }
         })
         .await;
-        let conn = Connection::new_inner(addr, Some("user"), Some("pass"), 500).await;
+        let conn =
+            Connection::new_inner(addr, Some("user"), Some("pass"), AuthMethod::default(), 500)
+                .await;
         assert!(matches!(conn, Err(Error::Other(_))));
     }
 
@@ -1116,7 +1129,7 @@ pub(super) mod tests {
             }
         })
         .await;
-        let conn = Connection::new_inner(addr, None, None, 500).await;
+        let conn = Connection::new_inner(addr, None, None, AuthMethod::default(), 500).await;
         assert!(matches!(conn, Err(Error::Other(_))));
     }
 

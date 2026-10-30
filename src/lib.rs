@@ -80,7 +80,10 @@ pub use rmpv::Value;
 pub use self::{
     builder::{ConnectionBuilder, ReconnectInterval},
     client::*,
-    codec::consts::{IteratorType, TransactionIsolationLevel},
+    codec::{
+        consts::{IteratorType, TransactionIsolationLevel},
+        request::AuthMethod,
+    },
     errors::{Error, TransactionError},
     tuple::{Tuple, TupleElement},
 };

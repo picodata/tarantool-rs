@@ -13,16 +13,44 @@ use crate::{
     errors::EncodingError,
 };
 
+#[derive(Clone, Copy, Debug, Default)]
+pub enum AuthMethod {
+    #[default]
+    ChapSha1,
+    Md5,
+    ScramSha256,
+    Ldap,
+}
+
+impl AuthMethod {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            AuthMethod::ChapSha1 => "chap-sha1",
+            AuthMethod::Md5 => "md5",
+            AuthMethod::ScramSha256 => "scram-sha256",
+            AuthMethod::Ldap => "ldap",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Auth<'a> {
     pub user_name: &'a str,
+    pub method: AuthMethod,
     pub scramble: Vec<u8>,
 }
 
 impl<'a> Auth<'a> {
-    pub(crate) fn new(user: &'a str, password: Option<&'a str>, salt: &'a [u8]) -> Self {
+    pub(crate) fn new(
+        user: &'a str,
+        password: Option<&'a str>,
+        salt: &'a [u8],
+        method: AuthMethod,
+    ) -> Self {
         Self {
             user_name: user,
+            method,
             scramble: prepare_scramble(password, salt),
         }
     }
@@ -42,7 +70,7 @@ impl Request for Auth<'_> {
         write_kv_str(&mut buf, keys::USER_NAME, self.user_name)?;
         rmp::encode::write_pfix(&mut buf, keys::TUPLE)?;
         rmp::encode::write_array_len(&mut buf, 2)?;
-        rmp::encode::write_str(&mut buf, "chap-sha1")?;
+        rmp::encode::write_str(&mut buf, self.method.as_str())?;
         rmp::encode::write_bin(&mut buf, &self.scramble)?;
         Ok(())
     }
