@@ -40,7 +40,7 @@ rustyline = "18"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
-tarantool-test-container = { path = "tarantool-test-container" }
+test-container = { path = "test-container" }
 
 [[example]]
 name = "cli_client"

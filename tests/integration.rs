@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tarantool_rs::{Connection, DmoOperation, Executor, ExecutorExt, Stream, errors::Error};
 use tracing_test::traced_test;
 
+use crate::common::{PicodataTestContainer, PicodataTestContainerExt};
 use crate::common::{TarantoolTestContainer, TarantoolTestContainerExt};
 
 mod common;
@@ -20,7 +21,7 @@ struct CrewMember {
 
 #[tokio::test]
 #[traced_test]
-async fn image_test() -> Result<(), anyhow::Error> {
+async fn tarantool_image_test() -> Result<(), anyhow::Error> {
     let container = TarantoolTestContainer::new_with_test_data();
 
     let conn = container.create_conn().await?;
@@ -31,7 +32,18 @@ async fn image_test() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[traced_test]
-async fn auth_ok() -> Result<(), anyhow::Error> {
+async fn picodata_image_test() -> Result<(), anyhow::Error> {
+    let container = PicodataTestContainer::new_with_test_data();
+
+    let conn = container.create_conn().await?;
+    conn.ping().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn tarantool_auth_ok() -> Result<(), anyhow::Error> {
     let container = TarantoolTestContainer::new_with_test_data();
 
     let conn = Connection::builder()
@@ -45,12 +57,91 @@ async fn auth_ok() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[traced_test]
-async fn auth_err() -> Result<(), anyhow::Error> {
+async fn tarantool_auth_err() -> Result<(), anyhow::Error> {
     let container = TarantoolTestContainer::new_with_test_data();
 
     assert_matches!(
         Connection::builder()
             .auth("Quark", Some("Q-0-0-0"))
+            .build(format!("127.0.0.1:{}", container.connect_port()))
+            .await
+            .map(drop),
+        Err(Error::Auth(_))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn picodata_auth_default_ok() -> Result<(), anyhow::Error> {
+    let container = PicodataTestContainer::new_with_test_data();
+
+    let conn = Connection::builder()
+        .auth("Sisko", Some("A-4-7-1"))
+        .build(format!("127.0.0.1:{}", container.connect_port()))
+        .await?;
+    conn.ping().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn picodata_auth_sha1_ok() -> Result<(), anyhow::Error> {
+    let container = PicodataTestContainer::new_with_test_data();
+
+    let conn = Connection::builder()
+        .auth("Sisko", Some("A-4-7-1"))
+        .auth_method(tarantool_rs::AuthMethod::ChapSha1)
+        .build(format!("127.0.0.1:{}", container.connect_port()))
+        .await?;
+    conn.ping().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn picodata_auth_sha1_err() -> Result<(), anyhow::Error> {
+    let container = PicodataTestContainer::new_with_test_data();
+
+    assert_matches!(
+        Connection::builder()
+            .auth("Quark", Some("Q-0-0-0"))
+            .build(format!("127.0.0.1:{}", container.connect_port()))
+            .await
+            .map(drop),
+        Err(Error::Auth(_))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn picodata_auth_md5_ok() -> Result<(), anyhow::Error> {
+    let container = PicodataTestContainer::new_with_test_data();
+
+    let conn = Connection::builder()
+        .auth("Kira", Some("A-B-C-D"))
+        .auth_method(tarantool_rs::AuthMethod::Md5)
+        .build(format!("127.0.0.1:{}", container.connect_port()))
+        .await?;
+    conn.ping().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn picodata_auth_md5_err() -> Result<(), anyhow::Error> {
+    let container = PicodataTestContainer::new_with_test_data();
+
+    assert_matches!(
+        Connection::builder()
+            .auth("Quark", Some("Q-0-0-0"))
+            .auth_method(tarantool_rs::AuthMethod::Md5)
             .build(format!("127.0.0.1:{}", container.connect_port()))
             .await
             .map(drop),

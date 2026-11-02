@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use futures::{StreamExt, stream::repeat_with};
 use tarantool_rs::{Connection, ExecutorExt};
 
-use tarantool_test_container::TarantoolTestContainer;
+use test_container::TarantoolTestContainer;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
