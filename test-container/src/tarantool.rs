@@ -1,5 +1,3 @@
-pub use testcontainers;
-
 use std::{borrow::Cow, collections::HashMap};
 
 use testcontainers::{

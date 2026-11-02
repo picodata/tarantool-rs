@@ -2,7 +2,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::{TryFutureExt, future::try_join_all};
 use tarantool_rs::{Connection, ExecutorExt};
 
-use tarantool_test_container::TarantoolTestContainer;
+use test_container::TarantoolTestContainer;
 
 fn bench_tarantool_rs(c: &mut Criterion) {
     let mut group = c.benchmark_group("tarantool_rs");
