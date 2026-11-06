@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  - Dead resend machinery, which never resent a request.
 
 ### Fixed
+ - A cache-miss PREPARE made during an SQL statement cache lookup now carries the lookup's connection generation, so the transport rejects it if that connection is lost while the request waits in the queue; before, one orphan prepared statement could be left on the new server session.
  - `upsert` sends the `UPSERT` opcode instead of `REPLACE`.
  - `DmoOperation::insert` is encoded with the `!` operator instead of `|`.
  - A grab-bag of protocol and handshake hardening: frame length decoding, error description bounds, auth/ID response sync validation, and writer task join failures reported as connection errors.

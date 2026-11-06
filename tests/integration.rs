@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::Duration;
 
 use assert_matches::assert_matches;
@@ -479,6 +480,27 @@ async fn wait_until_reset(probe: &Stream, limit: Duration) {
     }
 }
 
+/// Poll the future once — it must suspend and queue its first request while
+/// the server is down, which the lib tests pin per request type — then run
+/// it to completion on a worker thread while `container.start()` blocks.
+fn poll_once_and_spawn<F>(make_fut: impl FnOnce() -> F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let mut fut = Box::pin(make_fut());
+    let waker = std::task::Waker::noop();
+    assert!(
+        matches!(
+            fut.as_mut()
+                .poll(&mut std::task::Context::from_waker(waker)),
+            std::task::Poll::Pending
+        ),
+        "the call failed fast instead of waiting out the outage"
+    );
+    tokio::spawn(fut)
+}
+
 // Multi-thread: the dispatcher keeps running on the worker threads while
 // `stop` and `start` block the test's thread.
 #[tokio::test(flavor = "multi_thread")]
@@ -497,12 +519,11 @@ async fn transaction_created_during_outage_commits_after_reconnect() -> Result<(
     // The loss is observed while the server is still down.
     wait_until_reset(&probe, Duration::from_secs(60)).await;
 
-    // Begun during the outage, it belongs to the next connection. One poll
-    // creates its stream and queues its BEGIN before the server is back.
-    let begin_conn = conn.clone();
-    let mut begin = Box::pin(async move { begin_conn.transaction().await });
-    assert!(futures::poll!(begin.as_mut()).is_pending());
-    let begin = tokio::spawn(begin);
+    // Begun during the outage, it belongs to the next connection.
+    let begin = poll_once_and_spawn(|| {
+        let conn = conn.clone();
+        async move { conn.transaction().await }
+    });
     container.start();
 
     let tx = begin.await??;
@@ -598,11 +619,11 @@ async fn cached_sql_during_outage_uses_the_new_session() -> Result<(), anyhow::E
 
     // Called during the outage, after the loss was observed: the lookup
     // misses, so the call prepares on the new session instead of sending the
-    // old id there. One poll queues its PREPARE before the server is back.
-    let sql_conn = conn.clone();
-    let mut call = Box::pin(async move { sql_conn.execute_sql("SELECT ?", (1,)).await });
-    assert!(futures::poll!(call.as_mut()).is_pending());
-    let call = tokio::spawn(call);
+    // old id there.
+    let call = poll_once_and_spawn(|| {
+        let conn = conn.clone();
+        async move { conn.execute_sql("SELECT ?", (1,)).await }
+    });
     container.start();
 
     let _ = call.await??;

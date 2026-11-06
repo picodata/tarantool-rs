@@ -14,14 +14,18 @@ use tokio::time::timeout;
 use tracing::{debug, trace};
 
 use crate::{
-    ExecutorExt, Result,
+    Result,
     builder::ConnectionBuilder,
-    client::{Executor, Stream, Transaction, TransactionBuilder, sql::SqlStatementCache},
+    client::{
+        Executor, Stream, Transaction, TransactionBuilder,
+        sql::{PreparedSqlStatement, SqlStatementCache},
+    },
     codec::{
         consts::TransactionIsolationLevel,
-        request::{EncodedRequest, Request},
+        request::{EncodedRequest, Prepare, Request},
         response::ResponseBody,
     },
+    errors::Error,
     transport::{DispatcherSender, RequestSender},
 };
 
@@ -208,17 +212,25 @@ impl Connection {
         // Only one statement is prepared at a time; the other callers send
         // their text.
         let _preparing = cache.preparing.try_lock()?;
-        let stmt_id = match self.prepare_sql(statement).await {
-            Ok(x) => {
-                let stmt_id = x.stmt_id();
-                trace!(statement, "Statement prepared with id {stmt_id}");
-                stmt_id
-            }
+        // A queued PREPARE must not cross a reconnect and leave an uncached
+        // statement on the new session.
+        let prepared = self
+            .send_with_generation(
+                EncodedRequest::new(&Prepare::new(statement), None).ok()?,
+                Some(generation),
+            )
+            .await
+            .and_then(|response| {
+                PreparedSqlStatement::from_prepare_response(response, self).map_err(Error::from)
+            });
+        let stmt_id = match prepared {
+            Ok(x) => x.stmt_id(),
             Err(err) => {
                 debug!("Failed to prepare statement for cache: {:#}", err);
                 return None;
             }
         };
+        trace!(statement, "Statement prepared with id {stmt_id}");
         // The id belongs to the session the PREPARE ran on. If the connection
         // was lost meanwhile, the id is useless: send the text instead.
         if self.generation() != generation {
@@ -294,6 +306,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        ExecutorExt,
         codec::consts::RequestType,
         codec::consts::error_codes::{ER_SQL_EXECUTE, ER_WRONG_QUERY_ID},
         codec::response::Response,
@@ -548,6 +561,27 @@ mod tests {
         (conn, transaction.unwrap(), rx)
     }
 
+    #[tokio::test]
+    async fn one_poll_of_a_transaction_queues_its_begin() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::default(), None);
+
+        // The outage tests spawn a begun-during-the-outage call after one
+        // poll: that poll must queue the BEGIN, and only then wait for the
+        // reply.
+        let mut begin = pin!(conn.transaction());
+        assert!(
+            begin
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(
+            next_request(&mut rx).await,
+            (RequestType::Begin as u8, Some(1))
+        );
+    }
+
     const COMMIT: (u8, Option<u32>) = (RequestType::Commit as u8, Some(1));
     const ROLLBACK: (u8, Option<u32>) = (RequestType::Rollback as u8, Some(1));
 
@@ -659,34 +693,6 @@ mod tests {
     async fn transaction_finished_by_a_server_error_sends_nothing_more() {
         let (tx, rx) = mpsc::channel(8);
         let conn = test_connection(tx, Arc::default(), None);
-        let seen = spawn_fake_dispatcher(rx, reject_commit_and_rollback);
-
-        let transaction = conn.transaction().await.unwrap();
-        let err = transaction.commit().await.unwrap_err();
-        assert!(matches!(err.error, Error::Response(_)), "{:?}", err.error);
-
-        // Sent, a retried COMMIT would succeed on a stream without a
-        // transaction, and a ping would run outside one: both fail unsent.
-        let retried = err.transaction.commit().await.unwrap_err();
-        assert!(
-            matches!(retried.error, Error::Other(_)),
-            "{:?}",
-            retried.error
-        );
-        let res = retried.transaction.ping().await;
-        assert!(matches!(res, Err(Error::Other(_))), "{res:?}");
-        drop(retried);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            kinds(&seen),
-            vec![(RequestType::Begin as u8, Some(1)), COMMIT]
-        );
-    }
-
-    #[tokio::test]
-    async fn transaction_finished_by_a_server_error_sends_no_sql() {
-        let (tx, rx) = mpsc::channel(8);
-        let conn = test_connection(tx, Arc::default(), None);
         let seen = spawn_fake_dispatcher(rx, |request_type| {
             if request_type == RequestType::Commit as u8 {
                 reject_commit_and_rollback(request_type)
@@ -699,8 +705,14 @@ mod tests {
         let err = transaction.commit().await.unwrap_err();
         assert!(matches!(err.error, Error::Response(_)), "{:?}", err.error);
 
-        // Neither call may reach the statement cache, whose lookup would
-        // send a PREPARE for a transaction that can do nothing.
+        // Sent, a retried COMMIT would succeed on a stream without a
+        // transaction, and a ping would run outside one: both fail unsent.
+        let err = err.transaction.commit().await.unwrap_err();
+        assert!(matches!(err.error, Error::Other(_)), "{:?}", err.error);
+        let res = err.transaction.ping().await;
+        assert!(matches!(res, Err(Error::Other(_))), "{res:?}");
+        // Neither SQL call may reach the statement cache either, whose
+        // lookup would send a PREPARE for a transaction that can do nothing.
         let res = err.transaction.execute_sql("SELECT 1", ()).await;
         assert!(matches!(res, Err(Error::Other(_))), "{res:?}");
         let res = err.transaction.prepare_sql("SELECT 1").await;
@@ -810,6 +822,28 @@ mod tests {
             .map(|&(_, stream_id, _, generation)| (stream_id.is_some(), generation))
             .collect();
         assert_eq!(generations, vec![(true, Some(3)), (false, None)]);
+    }
+
+    #[tokio::test]
+    async fn stream_cache_lookup_prepare_carries_the_current_generation() {
+        let (tx, rx) = mpsc::channel(8);
+        let conn = test_connection(tx, Arc::new(AtomicU64::new(3)), None);
+        let seen = spawn_fake_dispatcher(rx, prepare_ok_body);
+
+        let stream = conn.stream();
+        assert_eq!(
+            stream.get_cached_sql_statement_id("SELECT 1").await,
+            Some(42)
+        );
+
+        // The transport rejects the cache-miss PREPARE if its connection is
+        // lost while the request waits in the queue.
+        let seen = seen.lock();
+        let prepare = seen
+            .iter()
+            .find(|(t, ..)| *t == RequestType::Prepare as u8)
+            .expect("lookup sent no PREPARE");
+        assert_eq!(prepare.3, Some(3), "PREPARE carried no generation");
     }
 
     #[tokio::test]
