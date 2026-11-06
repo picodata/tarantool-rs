@@ -6,11 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [picodata-0.15] - 2026-11-06
+
 ### Added
+ - `AuthMethod` and `ConnectionBuilder::auth_method` select `chap-sha1` (the default), `md5`, or `ldap` authentication.
  - `Error::ConnectionReset`, returned when a request is made through a stream or transaction whose connection was lost since it was created. Its message reads "Connection was lost; stream or transaction state on the server is gone".
  - `TransactionError`, returned by `commit` and `rollback` on failure; after a client-side failure it carries the transaction back unfinished, and the outcome of a COMMIT is then unknown.
 
 ### Changed
+ - Dependencies are updated, including `lru` 0.19 and `rustyline` 0.19; `md-5` 0.10 is added for MD5 authentication.
  - Breaking: `Transaction::commit` and `Transaction::rollback`, and the `commit` and `rollback` wrappers on `Space<Transaction>` and `OwnedIndex<Transaction>`, return `Result<(), TransactionError>`. Success and server errors consume the transaction. A client-side failure, such as a timeout or a closed connection, returns the transaction inside `TransactionError`, unfinished; dropping that error, or converting it into `Error`, sends a ROLLBACK unless the connection was lost. After such a failure the outcome of a COMMIT is unknown: it may have been applied, may have failed on the server, or may never have been sent. A retried COMMIT and that ROLLBACK succeed in every one of these cases, because Tarantool treats COMMIT and ROLLBACK without an active transaction as successful no-ops, so neither proves what happened.
  - Breaking: `DmoOperation::delete` takes a count and encodes the 3-element operation every Tarantool version requires.
  - Breaking: `upsert` returns `Result<()>`; UPSERT never returns a tuple.
