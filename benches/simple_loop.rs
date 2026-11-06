@@ -3,11 +3,11 @@ use std::time::{Duration, Instant};
 use futures::{StreamExt, stream::repeat_with};
 use tarantool_rs::{Connection, ExecutorExt};
 
-use test_container::TarantoolTestContainer;
+use test_container::{TarantoolImage, TestContainer};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::default();
+    let container = TestContainer::<TarantoolImage>::default();
 
     let conn = Connection::builder()
         .internal_simultaneous_requests_threshold(1000)

@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use tarantool_rs::{Connection, DmoOperation, Executor, ExecutorExt, Stream, errors::Error};
 use tracing_test::traced_test;
 
-use crate::common::{PicodataTestContainer, PicodataTestContainerExt};
-use crate::common::{TarantoolTestContainer, TarantoolTestContainerExt};
+use test_container::{PicodataImage, TarantoolImage, TestContainer};
+
+use crate::common::TestContainerExt;
 
 mod common;
 
@@ -22,7 +23,7 @@ struct CrewMember {
 #[tokio::test]
 #[traced_test]
 async fn tarantool_image_test() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn = container.create_conn().await?;
     conn.ping().await?;
@@ -33,7 +34,7 @@ async fn tarantool_image_test() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn picodata_image_test() -> Result<(), anyhow::Error> {
-    let container = PicodataTestContainer::new_with_test_data();
+    let container = TestContainer::<PicodataImage>::new_with_test_data();
 
     let conn = container.create_conn().await?;
     conn.ping().await?;
@@ -44,7 +45,7 @@ async fn picodata_image_test() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn tarantool_auth_ok() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn = Connection::builder()
         .auth("Sisko", Some("A-4-7-1"))
@@ -58,7 +59,7 @@ async fn tarantool_auth_ok() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn tarantool_auth_err() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     assert_matches!(
         Connection::builder()
@@ -75,7 +76,7 @@ async fn tarantool_auth_err() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn picodata_auth_default_ok() -> Result<(), anyhow::Error> {
-    let container = PicodataTestContainer::new_with_test_data();
+    let container = TestContainer::<PicodataImage>::new_with_test_data();
 
     let conn = Connection::builder()
         .auth("Sisko", Some("A-4-7-1"))
@@ -89,7 +90,7 @@ async fn picodata_auth_default_ok() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn picodata_auth_sha1_ok() -> Result<(), anyhow::Error> {
-    let container = PicodataTestContainer::new_with_test_data();
+    let container = TestContainer::<PicodataImage>::new_with_test_data();
 
     let conn = Connection::builder()
         .auth("Sisko", Some("A-4-7-1"))
@@ -104,7 +105,7 @@ async fn picodata_auth_sha1_ok() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn picodata_auth_sha1_err() -> Result<(), anyhow::Error> {
-    let container = PicodataTestContainer::new_with_test_data();
+    let container = TestContainer::<PicodataImage>::new_with_test_data();
 
     assert_matches!(
         Connection::builder()
@@ -120,8 +121,25 @@ async fn picodata_auth_sha1_err() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[traced_test]
+async fn picodata_auth_sha1_wrong_pass() -> Result<(), anyhow::Error> {
+    let container = TestContainer::<PicodataImage>::new_with_test_data();
+
+    assert_matches!(
+        Connection::builder()
+            .auth("Sisko", Some("Q-0-0-0"))
+            .build(format!("127.0.0.1:{}", container.connect_port()))
+            .await
+            .map(drop),
+        Err(Error::Auth(_))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
 async fn picodata_auth_md5_ok() -> Result<(), anyhow::Error> {
-    let container = PicodataTestContainer::new_with_test_data();
+    let container = TestContainer::<PicodataImage>::new_with_test_data();
 
     let conn = Connection::builder()
         .auth("Kira", Some("A-B-C-D"))
@@ -135,8 +153,26 @@ async fn picodata_auth_md5_ok() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 #[traced_test]
+async fn picodata_auth_md5_wrong_pass() -> Result<(), anyhow::Error> {
+    let container = TestContainer::<PicodataImage>::new_with_test_data();
+
+    assert_matches!(
+        Connection::builder()
+            .auth("Kira", Some("Q-0-0-0"))
+            .auth_method(tarantool_rs::AuthMethod::Md5)
+            .build(format!("127.0.0.1:{}", container.connect_port()))
+            .await
+            .map(drop),
+        Err(Error::Auth(_))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
 async fn picodata_auth_md5_err() -> Result<(), anyhow::Error> {
-    let container = PicodataTestContainer::new_with_test_data();
+    let container = TestContainer::<PicodataImage>::new_with_test_data();
 
     assert_matches!(
         Connection::builder()
@@ -154,7 +190,7 @@ async fn picodata_auth_md5_err() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn authenticated_user_commits_a_transaction_on_a_stream() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     // AUTH and ID share one round trip, and the server may handle ID first.
     let conn = Connection::builder()
@@ -173,7 +209,7 @@ async fn authenticated_user_commits_a_transaction_on_a_stream() -> Result<(), an
 #[tokio::test]
 #[traced_test]
 async fn eval() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn = container.create_conn().await?;
     let res: u32 = conn.eval("return ...", (42,)).await?.decode_result()?;
@@ -185,7 +221,7 @@ async fn eval() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn call() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn = container.create_conn().await?;
     let res: String = conn.call("station_name", (false,)).await?.decode_first()?;
@@ -197,7 +233,7 @@ async fn call() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn retrieve_schema() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn = container.create_conn().await?;
     let space = conn
@@ -220,7 +256,7 @@ async fn retrieve_schema() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn select_all() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn: Connection = container.create_conn().await?;
     let space = conn
@@ -248,7 +284,7 @@ async fn select_all() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn select_limits() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn: Connection = container.create_conn().await?;
     let space = conn
@@ -276,7 +312,7 @@ async fn select_limits() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn select_by_key() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn: Connection = container.create_conn().await?;
     let space = conn
@@ -305,7 +341,7 @@ async fn select_by_key() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn timeout() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn = Connection::builder()
         .timeout(Duration::from_millis(100))
@@ -323,7 +359,7 @@ async fn timeout() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn dmo() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
 
     let conn = Connection::builder()
         .timeout(Duration::from_millis(100))
@@ -386,7 +422,7 @@ async fn wait_until_reconnected(conn: &Connection, limit: Duration) {
 #[tokio::test]
 #[traced_test]
 async fn restart_mid_transaction_fails_the_stale_transaction() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_restartable();
+    let container = TestContainer::<TarantoolImage>::new_restartable();
     let conn = Connection::builder()
         .timeout(Duration::from_secs(5))
         .build(format!("127.0.0.1:{}", container.connect_port()))
@@ -448,7 +484,7 @@ async fn wait_until_reset(probe: &Stream, limit: Duration) {
 #[tokio::test(flavor = "multi_thread")]
 #[traced_test]
 async fn transaction_created_during_outage_commits_after_reconnect() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_restartable();
+    let container = TestContainer::<TarantoolImage>::new_restartable();
     // Long enough for BEGIN to wait out the outage in the queue.
     let conn = Connection::builder()
         .timeout(Duration::from_secs(30))
@@ -492,7 +528,7 @@ async fn transaction_created_during_outage_commits_after_reconnect() -> Result<(
 #[tokio::test]
 #[traced_test]
 async fn execute_sql_after_ddl_fails_once_then_recovers() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
     let conn = container.create_conn().await?;
 
     // Caches the statement.
@@ -516,7 +552,7 @@ async fn execute_sql_after_ddl_fails_once_then_recovers() -> Result<(), anyhow::
 #[tokio::test]
 #[traced_test]
 async fn prepared_statement_after_restart_returns_wrong_query_id() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_restartable();
+    let container = TestContainer::<TarantoolImage>::new_restartable();
     let conn = Connection::builder()
         .timeout(Duration::from_secs(5))
         .build(format!("127.0.0.1:{}", container.connect_port()))
@@ -545,7 +581,7 @@ async fn prepared_statement_after_restart_returns_wrong_query_id() -> Result<(),
 #[tokio::test(flavor = "multi_thread")]
 #[traced_test]
 async fn cached_sql_during_outage_uses_the_new_session() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_restartable();
+    let container = TestContainer::<TarantoolImage>::new_restartable();
     // Long enough for the PREPARE to wait out the outage in the queue.
     let conn = Connection::builder()
         .timeout(Duration::from_secs(30))
@@ -577,7 +613,7 @@ async fn cached_sql_during_outage_uses_the_new_session() -> Result<(), anyhow::E
 #[tokio::test]
 #[traced_test]
 async fn upsert_on_existing_tuple_applies_operations() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
     let conn = container.create_conn().await?;
     let space = conn
         .space("ds9_crew")
@@ -611,7 +647,7 @@ async fn upsert_on_existing_tuple_applies_operations() -> Result<(), anyhow::Err
 #[tokio::test]
 #[traced_test]
 async fn dmo_insert_operation_inserts_a_field() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
     let conn = container.create_conn().await?;
     let space = conn
         .space("ds9_crew")
@@ -641,7 +677,7 @@ async fn dmo_insert_operation_inserts_a_field() -> Result<(), anyhow::Error> {
 #[tokio::test]
 #[traced_test]
 async fn dmo_delete_operation_removes_fields() -> Result<(), anyhow::Error> {
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
     let conn = container.create_conn().await?;
     let space = conn
         .space("ds9_crew")
@@ -675,7 +711,7 @@ async fn dmo_delete_operation_removes_fields() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn response_above_64_mib_is_received() -> Result<(), anyhow::Error> {
     const LEN: usize = 70 * 1024 * 1024;
-    let container = TarantoolTestContainer::new_with_test_data();
+    let container = TestContainer::<TarantoolImage>::new_with_test_data();
     let conn = container.create_conn().await?;
     // Both live on the server session: a reconnect would make them stale.
     let stream = conn.stream();

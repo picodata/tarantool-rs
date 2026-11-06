@@ -1,9 +1,8 @@
 use std::{borrow::Cow, collections::HashMap};
 
 use testcontainers::{
-    Container, ContainerRequest, Image,
-    core::{ContainerPort, IntoContainerPort, WaitFor},
-    runners::SyncRunner,
+    Image,
+    core::{ContainerPort, WaitFor},
 };
 
 const IMAGE_NAME: &str = "tarantool/tarantool";
@@ -62,87 +61,5 @@ impl TarantoolImage {
     pub fn disable_mvcc(mut self) -> Self {
         drop(self.env_vars.remove("TT_MEMTX_USE_MVCC_ENGINE"));
         self
-    }
-}
-
-/// Run `f` on a helper OS thread and wait for it.
-///
-/// testcontainers' blocking API drives its own tokio runtime under the hood,
-/// and tokio panics when a runtime is entered from a worker thread of another
-/// runtime (as happens in #[tokio::test]). Every blocking testcontainers call
-/// is therefore pushed onto a dedicated OS thread.
-fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> std::thread::Result<T> {
-    std::thread::scope(|scope| scope.spawn(f).join())
-}
-
-pub struct TarantoolTestContainer {
-    container: Option<Container<TarantoolImage>>,
-}
-
-impl Default for TarantoolTestContainer {
-    fn default() -> Self {
-        Self::from_image(TarantoolImage::default())
-    }
-}
-
-impl TarantoolTestContainer {
-    /// Start a container from `image`: a `TarantoolImage`, or a request built
-    /// from one with `ImageExt`, for example with a mount, a command or a
-    /// fixed host port (`with_mapped_port`).
-    pub fn from_image(image: impl Into<ContainerRequest<TarantoolImage>> + Send + 'static) -> Self {
-        let container = off_runtime(move || image.start())
-            .expect("tarantool container start thread panicked")
-            .expect("failed to start tarantool test container");
-        Self {
-            container: Some(container),
-        }
-    }
-
-    pub fn connect_port(&self) -> u16 {
-        let container = self.container();
-        off_runtime(|| container.get_host_port_ipv4(3301.tcp()))
-            .expect("tarantool container port thread panicked")
-            .expect("failed to get mapped port 3301 of tarantool test container")
-    }
-
-    fn container(&self) -> &Container<TarantoolImage> {
-        self.container
-            .as_ref()
-            .expect("container is present until drop")
-    }
-
-    /// Stop the container. The server process exits, so every client
-    /// connection to it is dropped, and connecting fails until
-    /// [`Self::start`].
-    pub fn stop(&self) {
-        let container = self.container();
-        off_runtime(|| container.stop())
-            .expect("tarantool container stop thread panicked")
-            .expect("failed to stop tarantool test container");
-    }
-
-    /// Start the stopped container again. Returns once Docker has started
-    /// the container, not once Tarantool listens again.
-    pub fn start(&self) {
-        let container = self.container();
-        off_runtime(|| container.start())
-            .expect("tarantool container start thread panicked")
-            .expect("failed to start tarantool test container");
-    }
-
-    /// Stop the container and start it again. The server process restarts,
-    /// so every client connection to it is dropped. Returns once Docker has
-    /// started the container, not once Tarantool listens again.
-    pub fn restart(&self) {
-        self.stop();
-        self.start();
-    }
-}
-
-impl Drop for TarantoolTestContainer {
-    fn drop(&mut self) {
-        if let Some(container) = self.container.take() {
-            let _ = off_runtime(move || drop(container));
-        }
     }
 }
