@@ -1049,6 +1049,8 @@ pub(super) mod tests {
         let (_cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
         let (mut client_liveness, _client_handle) = oneshot::channel();
         let generation = 0;
+        // The bound `_rx` keeps the responder alive: dropped, it would make
+        // `run` skip the ping before the writer sees it.
         let (tx, _rx) = oneshot::channel();
         client_tx
             .send(client_request(ping_with_sync(1), None, tx))
