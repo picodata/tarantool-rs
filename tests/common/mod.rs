@@ -4,18 +4,17 @@ use test_container::testcontainers::{
     ContainerRequest, ImageExt,
     core::{IntoContainerPort, Mount},
 };
-pub use test_container::{PicodataImage, PicodataTestContainer};
-pub use test_container::{TarantoolImage, TarantoolTestContainer};
+use test_container::{PicodataImage, TarantoolImage, TestContainer};
 
 #[async_trait]
-pub trait TarantoolTestContainerExt {
+pub trait TestContainerExt {
     fn new_with_test_data() -> Self;
     fn new_restartable() -> Self;
     async fn create_conn(&self) -> Result<Connection, tarantool_rs::errors::Error>;
 }
 
 #[async_trait]
-impl TarantoolTestContainerExt for TarantoolTestContainer {
+impl TestContainerExt for TestContainer<TarantoolImage> {
     fn new_with_test_data() -> Self {
         Self::from_image(tarantool_image_running("tarantool_test_data.lua"))
     }
@@ -57,13 +56,7 @@ fn free_port() -> u16 {
 }
 
 #[async_trait]
-pub trait PicodataTestContainerExt {
-    fn new_with_test_data() -> Self;
-    async fn create_conn(&self) -> Result<Connection, tarantool_rs::errors::Error>;
-}
-
-#[async_trait]
-impl PicodataTestContainerExt for PicodataTestContainer {
+impl TestContainerExt for TestContainer<PicodataImage> {
     fn new_with_test_data() -> Self {
         Self::from_image(
             PicodataImage::default()
@@ -77,6 +70,10 @@ impl PicodataTestContainerExt for PicodataTestContainer {
                     "/opt/picodata/picodata_test_data.lua".to_owned(),
                 ]),
         )
+    }
+
+    fn new_restartable() -> Self {
+        Self::new_with_test_data()
     }
 
     async fn create_conn(&self) -> Result<Connection, tarantool_rs::errors::Error> {

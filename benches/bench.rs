@@ -2,7 +2,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::{TryFutureExt, future::try_join_all};
 use tarantool_rs::{Connection, ExecutorExt};
 
-use test_container::TarantoolTestContainer;
+use test_container::{TarantoolImage, TestContainer};
 
 fn bench_tarantool_rs(c: &mut Criterion) {
     let mut group = c.benchmark_group("tarantool_rs");
@@ -12,7 +12,7 @@ fn bench_tarantool_rs(c: &mut Criterion) {
         .enable_all()
         .build()
         .expect("Tokio multithread runtime built");
-    let container = TarantoolTestContainer::default();
+    let container = TestContainer::<TarantoolImage>::default();
     let conn = tokio_rt
         .block_on(async {
             Connection::builder()
